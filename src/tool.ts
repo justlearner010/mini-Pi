@@ -27,6 +27,7 @@ const MAX_READ_LINES = 300;
 const MAX_READ_BYTES = 256 * 1024;
 const MAX_DEPENDENCY_EDGES = 500;
 const MAX_DEPENDENCY_CYCLES = 500;
+const MAX_DEPENDENCY_CYCLE_STEPS = 100_000;
 const RESOLVABLE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 const BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, "")));
 
@@ -267,26 +268,53 @@ function canonicalCycle(cycle: string[]): string[] {
 }
 
 function findCycles(files: string[], edges: DependencyEdge[]): { cycles: string[][]; truncated: boolean } {
-  const adjacency = new Map(files.map((file) => [file, new Set<string>()]));
-  for (const edge of edges) adjacency.get(edge.from)?.add(edge.to);
+  const adjacency = new Map(files.map((file) => [file, [] as string[]]));
+  for (const edge of edges) {
+    const targets = adjacency.get(edge.from);
+    if (targets && !targets.includes(edge.to)) targets.push(edge.to);
+  }
+  for (const targets of adjacency.values()) targets.sort((left, right) => left.localeCompare(right));
+  const index = new Map<string, number>(), lowlink = new Map<string, number>(), stack: string[] = [], active = new Set<string>(), components: string[][] = [];
+  let nextIndex = 0;
+  const visitComponent = (file: string) => {
+    index.set(file, nextIndex); lowlink.set(file, nextIndex); nextIndex += 1; stack.push(file); active.add(file);
+    for (const next of adjacency.get(file) ?? []) {
+      if (!index.has(next)) { visitComponent(next); lowlink.set(file, Math.min(lowlink.get(file)!, lowlink.get(next)!)); }
+      else if (active.has(next)) lowlink.set(file, Math.min(lowlink.get(file)!, index.get(next)!));
+    }
+    if (lowlink.get(file) !== index.get(file)) return;
+    const component: string[] = [];
+    let node: string;
+    do { node = stack.pop()!; active.delete(node); component.push(node); } while (node !== file);
+    if (component.length > 1 || (adjacency.get(file) ?? []).includes(file)) components.push(component.sort((left, right) => left.localeCompare(right)));
+  };
+  for (const file of files) if (!index.has(file)) visitComponent(file);
   const cycles = new Map<string, string[]>();
-  let truncated = false;
-  for (const start of files) {
-    const path = [start];
-    const active = new Set(path);
-    const visit = (file: string) => {
-      for (const next of [...(adjacency.get(file) ?? [])].sort((left, right) => left.localeCompare(right))) {
+  let truncated = false, steps = 0;
+  for (const component of components) {
+    const members = new Set(component);
+    for (const start of component) {
+      const path = [start], pathNodes = new Set(path);
+      const visit = (file: string) => {
+        for (const next of adjacency.get(file) ?? []) {
+          if (++steps > MAX_DEPENDENCY_CYCLE_STEPS) { truncated = true; return; }
+          if (!members.has(next)) continue;
         if (next === start) {
           const cycle = canonicalCycle([...path, start]);
-          if (cycles.size === MAX_DEPENDENCY_CYCLES) { truncated = true; return; }
-          cycles.set(cycle.join("\0"), cycle);
-        } else if (next.localeCompare(start) > 0 && !active.has(next)) {
-          active.add(next); path.push(next); visit(next); path.pop(); active.delete(next);
+          const key = cycle.join("\0");
+          if (!cycles.has(key)) {
+            if (cycles.size === MAX_DEPENDENCY_CYCLES) { truncated = true; return; }
+            cycles.set(key, cycle);
+          }
+        } else if (next.localeCompare(start) > 0 && !pathNodes.has(next)) {
+          pathNodes.add(next); path.push(next); visit(next); path.pop(); pathNodes.delete(next);
           if (truncated) return;
         }
       }
     };
-    visit(start);
+      visit(start);
+      if (truncated) break;
+    }
     if (truncated) break;
   }
   return { cycles: [...cycles.values()].sort((left, right) => left.join("\0").localeCompare(right.join("\0"))), truncated };

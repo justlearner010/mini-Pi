@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import { analyzeDependenciesTool, readFileTool, scanProjectTool } from "../src/tool.js";
@@ -293,6 +294,20 @@ test("dependency analysis finds overlapping simple cycles from the same graph", 
     ["a.ts", "b.ts", "c.ts", "a.ts"],
     ["a.ts", "c.ts", "a.ts"]
   ]);
+});
+
+test("dependency analysis finishes layered diamond DAGs without reporting cycles", async () => {
+  const files: Record<string, string> = { "root.ts": 'import "./layer-0-a"; import "./layer-0-b";' };
+  for (let layer = 0; layer < 23; layer += 1) {
+    const imports = layer === 22 ? "" : `import "./layer-${layer + 1}-a"; import "./layer-${layer + 1}-b";`;
+    files[`layer-${layer}-a.ts`] = imports;
+    files[`layer-${layer}-b.ts`] = imports;
+  }
+  const started = performance.now();
+  const result = await analyze(await project(files));
+  assert.ok(performance.now() - started < 1_000);
+  assert.deepEqual(result.cycles, []);
+  assert.equal(result.truncated, false);
 });
 
 test("dependency analysis caps returned edges while preserving stable total counts", async () => {
