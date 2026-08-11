@@ -113,7 +113,7 @@ export const scanProjectTool: Tool = {
       const { path: scanPath } = await safeProjectPath(root, requestedPath ?? ".");
       if (!(await lstat(scanPath)).isDirectory()) throw new Error("Scan path is not a directory");
       const files: string[] = [];
-      await collectFiles(scanPath, scanPath, files);
+      await collectFiles(root, scanPath, files);
       files.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
       const returnedFiles = files.slice(0, MAX_SCAN_FILES);
       const pick = (kind: ReturnType<typeof relevantKind>) => returnedFiles.filter((file) => relevantKind(file) === kind);

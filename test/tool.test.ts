@@ -91,10 +91,10 @@ test("scan exposes a handwritten schema and scans a requested in-root subdirecto
   assert.deepEqual(result.content, {
     scannedPath: "nested",
     readmePath: null,
-    manifestPaths: ["tsconfig.app.json"],
-    sourceFiles: ["inside.ts"],
+    manifestPaths: ["nested/tsconfig.app.json"],
+    sourceFiles: ["nested/inside.ts"],
     unsupportedFiles: [],
-    tree: "inside.ts\ntsconfig.app.json",
+    tree: "nested/inside.ts\nnested/tsconfig.app.json",
     totalRelevantFiles: 2,
     returnedFileCount: 2,
     truncated: false
