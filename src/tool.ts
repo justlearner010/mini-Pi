@@ -267,11 +267,13 @@ function canonicalCycle(cycle: string[]): string[] {
   return [...variants[0], variants[0][0]];
 }
 
-function findCycles(files: string[], edges: DependencyEdge[]): { cycles: string[][]; truncated: boolean } {
+export function findCycles(files: string[], edges: DependencyEdge[]): { cycles: string[][]; truncated: boolean } {
   const adjacency = new Map(files.map((file) => [file, [] as string[]]));
+  const adjacencyMembers = new Map(files.map((file) => [file, new Set<string>()]));
   for (const edge of edges) {
     const targets = adjacency.get(edge.from);
-    if (targets && !targets.includes(edge.to)) targets.push(edge.to);
+    const members = adjacencyMembers.get(edge.from);
+    if (targets && members && !members.has(edge.to)) { targets.push(edge.to); members.add(edge.to); }
   }
   for (const targets of adjacency.values()) targets.sort((left, right) => left.localeCompare(right));
   const index = new Map<string, number>(), lowlink = new Map<string, number>(), stack: string[] = [], active = new Set<string>(), components: string[][] = [];
@@ -297,8 +299,8 @@ function findCycles(files: string[], edges: DependencyEdge[]): { cycles: string[
       const path = [start], pathNodes = new Set(path);
       const visit = (file: string) => {
         for (const next of adjacency.get(file) ?? []) {
-          if (++steps > MAX_DEPENDENCY_CYCLE_STEPS) { truncated = true; return; }
           if (!members.has(next)) continue;
+          if (++steps > MAX_DEPENDENCY_CYCLE_STEPS) { truncated = true; return; }
         if (next === start) {
           const cycle = canonicalCycle([...path, start]);
           const key = cycle.join("\0");

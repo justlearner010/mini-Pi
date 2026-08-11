@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, readFileTool, scanProjectTool } from "../src/tool.js";
+import { analyzeDependenciesTool, findCycles, readFileTool, scanProjectTool } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -294,6 +294,26 @@ test("dependency analysis finds overlapping simple cycles from the same graph", 
     ["a.ts", "b.ts", "c.ts", "a.ts"],
     ["a.ts", "c.ts", "a.ts"]
   ]);
+});
+
+test("cycle discovery ignores earlier sorted non-SCC neighbors without exhausting its step budget", () => {
+  const files = ["a.ts", "b.ts"];
+  const edges = [
+    ...Array.from({ length: 100_001 }, (_, index) => ({
+      from: "a.ts",
+      to: `acyclic-${String(index).padStart(6, "0")}.ts`,
+      specifier: "",
+      kind: "import" as const,
+      typeOnly: false
+    })),
+    { from: "a.ts", to: "b.ts", specifier: "", kind: "import" as const, typeOnly: false },
+    { from: "b.ts", to: "a.ts", specifier: "", kind: "import" as const, typeOnly: false }
+  ];
+
+  const result = findCycles(files, edges);
+
+  assert.deepEqual(result.cycles, [["a.ts", "b.ts", "a.ts"]]);
+  assert.equal(result.truncated, false);
 });
 
 test("dependency analysis finishes layered diamond DAGs without reporting cycles", async () => {
