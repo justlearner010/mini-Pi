@@ -1,0 +1,21 @@
+{
+  "name": "mini-pi",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx --test test/**/*.test.ts",
+    "dev": "tsx src/tool.ts"
+  },
+  "dependencies": {
+    "@inquirer/select": "latest",
+    "openai": "latest",
+    "typescript": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest"
+  }
+}
