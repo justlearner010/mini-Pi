@@ -1,5 +1,7 @@
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { builtinModules } from "node:module";
+import { createScanner, LanguageVariant, SyntaxKind } from "typescript/unstable/ast";
 
 export interface ToolContext {
   rootDir: string;
@@ -23,6 +25,9 @@ const UNSUPPORTED_SOURCE_EXTENSIONS = new Set([".py", ".rs", ".go", ".java", ".c
 const MAX_SCAN_FILES = 500;
 const MAX_READ_LINES = 300;
 const MAX_READ_BYTES = 256 * 1024;
+const MAX_DEPENDENCY_EDGES = 500;
+const RESOLVABLE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
+const BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, "")));
 
 type ScanContent = {
   scannedPath: string;
@@ -205,4 +210,173 @@ export const readFileTool: Tool = {
   }
 };
 
-export const tools: Tool[] = [scanProjectTool, readFileTool];
+type DependencyKind = "import" | "export";
+type Dependency = { from: string; specifier: string; kind: DependencyKind; typeOnly: boolean };
+type DependencyEdge = Dependency & { to: string };
+type UnresolvedDependency = Dependency & { reason: "alias" | "missing" | "unsupported" };
+
+function isSourcePath(path: string): boolean {
+  return SUPPORTED_SOURCE_EXTENSIONS.has(extname(path).toLowerCase());
+}
+
+function compareDependency(left: Dependency, right: Dependency): number {
+  return left.from.localeCompare(right.from) || left.specifier.localeCompare(right.specifier) || left.kind.localeCompare(right.kind) || Number(left.typeOnly) - Number(right.typeOnly);
+}
+
+function extractImports(path: string, text: string): Dependency[] {
+  const imports: Dependency[] = [];
+  const scanner = createScanner(true, LanguageVariant.Standard, text);
+  let kind = scanner.scan();
+  while (kind !== SyntaxKind.EndOfFile) {
+    if (kind !== SyntaxKind.ImportKeyword && kind !== SyntaxKind.ExportKeyword) { kind = scanner.scan(); continue; }
+    const dependencyKind: DependencyKind = kind === SyntaxKind.ImportKeyword ? "import" : "export";
+    let typeOnly = false;
+    let next = scanner.scan();
+    if (next === SyntaxKind.TypeKeyword) { typeOnly = true; next = scanner.scan(); }
+    const sideEffectImport = dependencyKind === "import" && next === SyntaxKind.StringLiteral;
+    let sawFrom = false;
+    while (next !== SyntaxKind.EndOfFile && next !== SyntaxKind.SemicolonToken) {
+      if (next === SyntaxKind.FromKeyword) sawFrom = true;
+      if (next === SyntaxKind.StringLiteral) {
+        if (sideEffectImport || sawFrom) imports.push({ from: path, specifier: scanner.getTokenValue(), kind: dependencyKind, typeOnly });
+        break;
+      }
+      next = scanner.scan();
+    }
+    kind = scanner.scan();
+  }
+  return imports;
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function resolveImportPath(root: string, from: string, specifier: string): Promise<{ path?: string; reason?: "alias" | "missing" | "unsupported" }> {
+  if (!specifier.startsWith(".") && !specifier.startsWith("/")) return { reason: "alias" };
+  const base = resolve(root, from, "..");
+  const target = resolve(base, specifier);
+  if (!isWithin(root, target)) return { reason: "missing" };
+  const extension = extname(target).toLowerCase();
+  if (extension && !SUPPORTED_SOURCE_EXTENSIONS.has(extension)) return { reason: "unsupported" };
+  const candidates = extension
+    ? [target, ...(extension === ".js" ? [target.slice(0, -3) + ".ts", target.slice(0, -3) + ".tsx"] : [])]
+    : [...RESOLVABLE_EXTENSIONS.map((item) => target + item), ...RESOLVABLE_EXTENSIONS.map((item) => resolve(target, "index" + item))];
+  for (const candidate of candidates) if (await fileExists(candidate)) return isSourcePath(candidate) ? { path: relativePath(root, candidate) } : { reason: "unsupported" };
+  return { reason: "missing" };
+}
+
+function canonicalCycle(cycle: string[]): string[] {
+  const nodes = cycle.slice(0, -1);
+  const variants = nodes.map((_, index) => [...nodes.slice(index), ...nodes.slice(0, index)]);
+  variants.sort((left, right) => left.join("\0").localeCompare(right.join("\0")));
+  return [...variants[0], variants[0][0]];
+}
+
+function findCycles(files: string[], edges: DependencyEdge[]): string[][] {
+  const adjacency = new Map(files.map((file) => [file, [] as string[]]));
+  for (const edge of edges) adjacency.get(edge.from)?.push(edge.to);
+  for (const paths of adjacency.values()) paths.sort((left, right) => left.localeCompare(right));
+  const visited = new Set<string>();
+  const stack: string[] = [];
+  const active = new Set<string>();
+  const cycles = new Map<string, string[]>();
+  const visit = (file: string) => {
+    visited.add(file); active.add(file); stack.push(file);
+    for (const next of adjacency.get(file) ?? []) {
+      if (active.has(next)) {
+        const cycle = canonicalCycle([...stack.slice(stack.indexOf(next)), next]);
+        cycles.set(cycle.join("\0"), cycle);
+      } else if (!visited.has(next)) visit(next);
+    }
+    stack.pop(); active.delete(file);
+  };
+  for (const file of files) if (!visited.has(file)) visit(file);
+  return [...cycles.values()].sort((left, right) => left.join("\0").localeCompare(right.join("\0")));
+}
+
+function buildEntryTree(entry: string, edges: DependencyEdge[]): string {
+  const adjacency = new Map<string, string[]>();
+  for (const edge of edges) (adjacency.get(edge.from) ?? adjacency.set(edge.from, []).get(edge.from)!).push(edge.to);
+  for (const paths of adjacency.values()) paths.sort((left, right) => left.localeCompare(right));
+  const shown = new Set<string>();
+  const lines: string[] = [];
+  const visit = (file: string, depth: number, ancestors: Set<string>) => {
+    const indent = "  ".repeat(depth);
+    if (ancestors.has(file)) { lines.push(`${indent}${file} [cycle]`); return; }
+    if (shown.has(file)) { lines.push(`${indent}${file} [already shown]`); return; }
+    shown.add(file); lines.push(`${indent}${file}`);
+    const nextAncestors = new Set(ancestors); nextAncestors.add(file);
+    for (const child of adjacency.get(file) ?? []) visit(child, depth + 1, nextAncestors);
+  };
+  visit(entry, 0, new Set());
+  return lines.join("\n");
+}
+
+export const analyzeDependenciesTool: Tool = {
+  name: "analyze_dependencies",
+  description: "Analyze static TypeScript and JavaScript dependency relationships safely.",
+  parameters: {
+    type: "object",
+    properties: { path: { type: "string" }, entry: { type: "string" } },
+    additionalProperties: false
+  },
+  async execute(args, context) {
+    try {
+      if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some((key) => key !== "path" && key !== "entry")) throw new Error("Arguments must be an object with optional path and entry");
+      const input = args as { path?: unknown; entry?: unknown };
+      if (input.path !== undefined && typeof input.path !== "string" || input.entry !== undefined && typeof input.entry !== "string") throw new Error("Path and entry must be strings");
+      const root = await realpath(context.rootDir);
+      const { path: scanPath } = await safeProjectPath(root, (input.path as string | undefined) ?? ".");
+      if (!(await lstat(scanPath)).isDirectory()) throw new Error("Scan path is not a directory");
+      const discovered: string[] = [];
+      await collectFiles(root, scanPath, discovered);
+      discovered.sort((left, right) => left.localeCompare(right));
+      const analyzedFiles = discovered.filter(isSourcePath);
+      const unsupportedFiles = discovered.filter((file) => relevantKind(file) === "unsupported");
+      let entry: string | undefined;
+      if (input.entry !== undefined) {
+        const entryResult = await safeProjectPath(root, input.entry as string);
+        if (!(await lstat(entryResult.path)).isFile() || !isSourcePath(entryResult.path) || !isWithin(scanPath, entryResult.path)) throw new Error("Entry must be a supported source file within the analysis path");
+        entry = relativePath(root, entryResult.path);
+      }
+      const edges: DependencyEdge[] = [], builtins: { from: string; specifier: string }[] = [], packages: { from: string; packageName: string; specifier: string }[] = [], unresolved: UnresolvedDependency[] = [];
+      for (const file of analyzedFiles) {
+        const imports = extractImports(file, await readFile(resolve(root, file), "utf8"));
+        for (const dependency of imports) {
+          const bareSpecifier = dependency.specifier.replace(/^node:/, "");
+          if (BUILTINS.has(bareSpecifier)) builtins.push({ from: file, specifier: dependency.specifier });
+          else if (!dependency.specifier.startsWith(".") && !dependency.specifier.startsWith("/")) {
+            if (dependency.specifier.startsWith("@/")) unresolved.push({ ...dependency, reason: "alias" });
+            else {
+              const parts = dependency.specifier.split("/");
+              packages.push({ from: file, packageName: dependency.specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0], specifier: dependency.specifier });
+            }
+          } else {
+            const resolved = await resolveImportPath(root, file, dependency.specifier);
+            if (resolved.path) edges.push({ ...dependency, to: resolved.path });
+            else unresolved.push({ ...dependency, reason: resolved.reason ?? "missing" });
+          }
+        }
+      }
+      edges.sort((left, right) => compareDependency(left, right) || left.to.localeCompare(right.to));
+      builtins.sort((left, right) => left.from.localeCompare(right.from) || left.specifier.localeCompare(right.specifier));
+      packages.sort((left, right) => left.from.localeCompare(right.from) || left.packageName.localeCompare(right.packageName) || left.specifier.localeCompare(right.specifier));
+      unresolved.sort(compareDependency);
+      const returnedEdges = edges.slice(0, MAX_DEPENDENCY_EDGES);
+      return { content: {
+        analyzedPath: relativePath(root, scanPath) || ".", entry: entry ?? null, analyzedFiles, unsupportedFiles, edges: returnedEdges, builtins, packages, unresolved,
+        cycles: findCycles(analyzedFiles, edges), entryTree: entry ? buildEntryTree(entry, edges) : null,
+        analyzedFileCount: analyzedFiles.length, totalEdgeCount: edges.length, returnedEdgeCount: returnedEdges.length, truncated: edges.length > returnedEdges.length
+      }, isError: false };
+    } catch (error) {
+      return { content: error instanceof Error ? error.message : "Unable to analyze dependencies", isError: true };
+    }
+  }
+};
+
+export const tools: Tool[] = [scanProjectTool, readFileTool, analyzeDependenciesTool];

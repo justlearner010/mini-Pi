@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { readFileTool, scanProjectTool } from "../src/tool.js";
+import { analyzeDependenciesTool, readFileTool, scanProjectTool } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -18,6 +18,12 @@ async function project(files: Record<string, string | Buffer> = {}) {
 
 async function scan(rootDir: string) {
   const result = await scanProjectTool.execute({}, { rootDir });
+  assert.equal(result.isError, false);
+  return result.content as Record<string, unknown>;
+}
+
+async function analyze(rootDir: string, args: Record<string, unknown> = {}) {
+  const result = await analyzeDependenciesTool.execute(args, { rootDir });
   assert.equal(result.isError, false);
   return result.content as Record<string, unknown>;
 }
@@ -197,4 +203,122 @@ test("read rejects binary and non-existent files", async () => {
 test("read rejects unknown arguments", async () => {
   const result = await readFileTool.execute({ path: "safe.txt", unexpected: true }, { rootDir: await project({ "safe.txt": "ok" }) });
   assert.equal(result.isError, true);
+});
+
+test("dependency analysis uses the TypeScript parser for static forms but ignores comments and strings", async () => {
+  const result = await analyze(await project({
+    "src/main.ts": [
+      'import value from "./value.js";',
+      'import type { Shape } from "./types.js";',
+      'import "./setup";',
+      'export { helper } from "./helper";',
+      'export * from "./barrel";',
+      '// import "./comment";',
+      'const pretend = "import \\\"./string\\\"";'
+    ].join("\n"),
+    "src/value.ts": "export default 1;",
+    "src/types.ts": "export type Shape = {};",
+    "src/setup.ts": "",
+    "src/helper.ts": "export const helper = 1;",
+    "src/barrel.ts": ""
+  }));
+  assert.deepEqual(result.edges, [
+    { from: "src/main.ts", to: "src/barrel.ts", specifier: "./barrel", kind: "export", typeOnly: false },
+    { from: "src/main.ts", to: "src/helper.ts", specifier: "./helper", kind: "export", typeOnly: false },
+    { from: "src/main.ts", to: "src/setup.ts", specifier: "./setup", kind: "import", typeOnly: false },
+    { from: "src/main.ts", to: "src/types.ts", specifier: "./types.js", kind: "import", typeOnly: true },
+    { from: "src/main.ts", to: "src/value.ts", specifier: "./value.js", kind: "import", typeOnly: false }
+  ]);
+  assert.equal(result.totalEdgeCount, 5);
+  assert.equal(result.returnedEdgeCount, 5);
+  assert.equal(result.truncated, false);
+});
+
+test("dependency analysis resolves extensions and index files, and classifies builtins and packages", async () => {
+  const result = await analyze(await project({
+    "main.ts": 'import "node:fs"; import "path"; import "react/jsx-runtime"; import "@scope/pkg/subpath"; import "./dir"; import "./view.jsx";',
+    "dir/index.tsx": "",
+    "view.jsx": ""
+  }));
+  assert.deepEqual(result.edges, [
+    { from: "main.ts", to: "dir/index.tsx", specifier: "./dir", kind: "import", typeOnly: false },
+    { from: "main.ts", to: "view.jsx", specifier: "./view.jsx", kind: "import", typeOnly: false }
+  ]);
+  assert.deepEqual(result.builtins, [
+    { from: "main.ts", specifier: "node:fs" },
+    { from: "main.ts", specifier: "path" }
+  ]);
+  assert.deepEqual(result.packages, [
+    { from: "main.ts", packageName: "@scope/pkg", specifier: "@scope/pkg/subpath" },
+    { from: "main.ts", packageName: "react", specifier: "react/jsx-runtime" }
+  ]);
+});
+
+test("dependency analysis explicitly reports aliases, missing files, and unsupported relative files", async () => {
+  const result = await analyze(await project({
+    "main.ts": 'import "@/app"; import "./missing"; import "./native.py";',
+    "native.py": "print('x')"
+  }));
+  assert.deepEqual(result.unresolved, [
+    { from: "main.ts", specifier: "./missing", kind: "import", typeOnly: false, reason: "missing" },
+    { from: "main.ts", specifier: "./native.py", kind: "import", typeOnly: false, reason: "unsupported" },
+    { from: "main.ts", specifier: "@/app", kind: "import", typeOnly: false, reason: "alias" }
+  ]);
+  assert.deepEqual(result.unsupportedFiles, ["native.py"]);
+});
+
+test("dependency analysis reports canonical deduplicated self, two-node, and multi-node cycles", async () => {
+  const result = await analyze(await project({
+    "a.ts": 'import "./a"; import "./b";',
+    "b.ts": 'import "./c"; import "./d";',
+    "c.ts": 'import "./a";',
+    "d.ts": 'import "./b";'
+  }));
+  assert.deepEqual(result.cycles, [
+    ["a.ts", "a.ts"],
+    ["a.ts", "b.ts", "c.ts", "a.ts"],
+    ["b.ts", "d.ts", "b.ts"]
+  ]);
+});
+
+test("dependency analysis caps returned edges while preserving stable total counts", async () => {
+  const files: Record<string, string> = { "main.ts": Array.from({ length: 501 }, (_, i) => `import "./parts/${i}";`).join("\n") };
+  for (let i = 0; i < 501; i += 1) files[`parts/${i}.ts`] = "";
+  const result = await analyze(await project(files));
+  assert.equal(result.analyzedFileCount, 502);
+  assert.equal(result.totalEdgeCount, 501);
+  assert.equal(result.returnedEdgeCount, 500);
+  assert.equal(result.truncated, true);
+  assert.equal((result.edges as { specifier: string }[])[0].specifier, "./parts/0");
+});
+
+test("dependency analysis validates an entry, constrains it to path, and renders a repeat-aware tree", async () => {
+  const rootDir = await project({
+    "src/main.ts": 'import "./left"; import "./right";',
+    "src/left.ts": 'import "./shared";',
+    "src/right.ts": 'import "./shared"; import "./main";',
+    "src/shared.ts": "",
+    "other.ts": ""
+  });
+  const result = await analyze(rootDir, { path: "src", entry: "src/main.ts" });
+  assert.deepEqual(result, {
+    analyzedPath: "src",
+    entry: "src/main.ts",
+    analyzedFiles: ["src/left.ts", "src/main.ts", "src/right.ts", "src/shared.ts"],
+    unsupportedFiles: [],
+    edges: [
+      { from: "src/left.ts", to: "src/shared.ts", specifier: "./shared", kind: "import", typeOnly: false },
+      { from: "src/main.ts", to: "src/left.ts", specifier: "./left", kind: "import", typeOnly: false },
+      { from: "src/main.ts", to: "src/right.ts", specifier: "./right", kind: "import", typeOnly: false },
+      { from: "src/right.ts", to: "src/main.ts", specifier: "./main", kind: "import", typeOnly: false },
+      { from: "src/right.ts", to: "src/shared.ts", specifier: "./shared", kind: "import", typeOnly: false }
+    ],
+    builtins: [], packages: [], unresolved: [],
+    cycles: [["src/main.ts", "src/right.ts", "src/main.ts"]],
+    entryTree: "src/main.ts\n  src/left.ts\n    src/shared.ts\n  src/right.ts\n    src/main.ts [cycle]\n    src/shared.ts [already shown]",
+    analyzedFileCount: 4, totalEdgeCount: 5, returnedEdgeCount: 5, truncated: false
+  });
+  assert.equal((await analyzeDependenciesTool.execute({ entry: "other.ts" }, { rootDir })).isError, false);
+  assert.equal((await analyzeDependenciesTool.execute({ path: "src", entry: "other.ts" }, { rootDir })).isError, true);
+  assert.equal((await analyzeDependenciesTool.execute({ entry: "missing.ts" }, { rootDir })).isError, true);
 });
