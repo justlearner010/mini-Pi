@@ -213,6 +213,7 @@ test("dependency analysis uses the TypeScript parser for static forms but ignore
       'import "./setup";',
       'export { helper } from "./helper";',
       'export * from "./barrel";',
+      'export const from = "./not-a-dependency";',
       '// import "./comment";',
       'const pretend = "import \\\"./string\\\"";'
     ].join("\n"),
@@ -232,6 +233,7 @@ test("dependency analysis uses the TypeScript parser for static forms but ignore
   assert.equal(result.totalEdgeCount, 5);
   assert.equal(result.returnedEdgeCount, 5);
   assert.equal(result.truncated, false);
+  assert.deepEqual(result.unresolved, []);
 });
 
 test("dependency analysis resolves extensions and index files, and classifies builtins and packages", async () => {

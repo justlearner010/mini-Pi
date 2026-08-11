@@ -1,7 +1,7 @@
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { builtinModules } from "node:module";
-import { createScanner, LanguageVariant, SyntaxKind } from "typescript/unstable/ast";
+import ts from "typescript";
 
 export interface ToolContext {
   rootDir: string;
@@ -224,26 +224,14 @@ function compareDependency(left: Dependency, right: Dependency): number {
 }
 
 function extractImports(path: string, text: string): Dependency[] {
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, false);
   const imports: Dependency[] = [];
-  const scanner = createScanner(true, LanguageVariant.Standard, text);
-  let kind = scanner.scan();
-  while (kind !== SyntaxKind.EndOfFile) {
-    if (kind !== SyntaxKind.ImportKeyword && kind !== SyntaxKind.ExportKeyword) { kind = scanner.scan(); continue; }
-    const dependencyKind: DependencyKind = kind === SyntaxKind.ImportKeyword ? "import" : "export";
-    let typeOnly = false;
-    let next = scanner.scan();
-    if (next === SyntaxKind.TypeKeyword) { typeOnly = true; next = scanner.scan(); }
-    const sideEffectImport = dependencyKind === "import" && next === SyntaxKind.StringLiteral;
-    let sawFrom = false;
-    while (next !== SyntaxKind.EndOfFile && next !== SyntaxKind.SemicolonToken) {
-      if (next === SyntaxKind.FromKeyword) sawFrom = true;
-      if (next === SyntaxKind.StringLiteral) {
-        if (sideEffectImport || sawFrom) imports.push({ from: path, specifier: scanner.getTokenValue(), kind: dependencyKind, typeOnly });
-        break;
-      }
-      next = scanner.scan();
+  for (const statement of source.statements) {
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+      imports.push({ from: path, specifier: statement.moduleSpecifier.text, kind: "import", typeOnly: statement.importClause?.isTypeOnly ?? false });
+    } else if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+      imports.push({ from: path, specifier: statement.moduleSpecifier.text, kind: "export", typeOnly: statement.isTypeOnly });
     }
-    kind = scanner.scan();
   }
   return imports;
 }

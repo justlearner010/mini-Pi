@@ -13,7 +13,7 @@
   "dependencies": {
     "@inquirer/select": "5.2.1",
     "openai": "7.4.0",
-    "typescript": "7.0.2"
+    "typescript": "5.9.3"
   },
   "devDependencies": {
     "@types/node": "26.2.0",
