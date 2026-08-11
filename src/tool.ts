@@ -22,6 +22,7 @@ const SUPPORTED_SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs
 const UNSUPPORTED_SOURCE_EXTENSIONS = new Set([".rs", ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".cs", ".swift", ".kt", ".scala"]);
 const MAX_SCAN_FILES = 500;
 const MAX_READ_LINES = 300;
+const MAX_READ_BYTES = 256 * 1024;
 
 type ScanContent = {
   scannedPath: string;
@@ -29,7 +30,7 @@ type ScanContent = {
   manifestPaths: string[];
   sourceFiles: string[];
   unsupportedFiles: string[];
-  tree: string[];
+  tree: string;
   totalRelevantFiles: number;
   returnedFileCount: number;
   truncated: boolean;
@@ -65,7 +66,7 @@ function relativePath(root: string, path: string): string {
 function relevantKind(path: string): "readme" | "manifest" | "source" | "unsupported" | "document" | undefined {
   const name = basename(path).toLowerCase();
   if (name === "readme.md" || name === "readme") return "readme";
-  if (name === "package.json" || name === "tsconfig.json") return "manifest";
+  if (name === "package.json" || /^tsconfig.*\.json$/.test(name)) return "manifest";
   const extension = extname(name);
   if (SUPPORTED_SOURCE_EXTENSIONS.has(extension)) return "source";
   if (UNSUPPORTED_SOURCE_EXTENSIONS.has(extension)) return "unsupported";
@@ -89,25 +90,34 @@ async function collectFiles(root: string, directory: string, files: string[]): P
 export const scanProjectTool: Tool = {
   name: "scan_project",
   description: "List relevant project files without leaving the project root.",
-  parameters: {},
-  async execute(_args, context) {
+  parameters: {
+    type: "object",
+    properties: { path: { type: "string", description: "Optional relative directory to scan" } },
+    additionalProperties: false
+  },
+  async execute(args, context) {
     try {
       const root = await realpath(context.rootDir);
+      if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some((key) => key !== "path")) throw new Error("Arguments must be an object with an optional path");
+      const requestedPath = "path" in args ? args.path : ".";
+      if (requestedPath !== undefined && typeof requestedPath !== "string") throw new Error("Scan path must be a string");
+      const { path: scanPath } = await safeProjectPath(root, requestedPath ?? ".");
+      if (!(await lstat(scanPath)).isDirectory()) throw new Error("Scan path is not a directory");
       const files: string[] = [];
-      await collectFiles(root, root, files);
+      await collectFiles(scanPath, scanPath, files);
       files.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
-      const tree = files.slice(0, MAX_SCAN_FILES);
-      const pick = (kind: ReturnType<typeof relevantKind>) => files.filter((file) => relevantKind(file) === kind);
+      const returnedFiles = files.slice(0, MAX_SCAN_FILES);
+      const pick = (kind: ReturnType<typeof relevantKind>) => returnedFiles.filter((file) => relevantKind(file) === kind);
       const content: ScanContent = {
-        scannedPath: root,
+        scannedPath: relativePath(root, scanPath) || ".",
         readmePath: pick("readme")[0] ?? null,
         manifestPaths: pick("manifest"),
         sourceFiles: pick("source"),
         unsupportedFiles: pick("unsupported"),
-        tree,
+        tree: returnedFiles.join("\n"),
         totalRelevantFiles: files.length,
-        returnedFileCount: tree.length,
-        truncated: files.length > tree.length
+        returnedFileCount: returnedFiles.length,
+        truncated: files.length > returnedFiles.length
       };
       return { content, isError: false };
     } catch (error) {
@@ -119,7 +129,16 @@ export const scanProjectTool: Tool = {
 export const readFileTool: Tool = {
   name: "read_file",
   description: "Read a text file safely from the project root.",
-  parameters: {},
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string" },
+      startLine: { type: "integer", minimum: 1 },
+      endLine: { type: "integer", minimum: 1 }
+    },
+    required: ["path"],
+    additionalProperties: false
+  },
   async execute(args, context) {
     try {
       if (!args || typeof args !== "object" || !("path" in args) || typeof args.path !== "string") throw new Error("A relative file path is required");
@@ -139,7 +158,28 @@ export const readFileTool: Tool = {
       const start = Math.min(from as number, Math.max(totalLines, 1));
       const maximumEnd = Math.min(totalLines, start + MAX_READ_LINES - 1);
       const end = requestedEnd === undefined ? maximumEnd : Math.min(requestedEnd as number, maximumEnd);
-      const content = lines.slice(start - 1, end).join("\n");
+      const selectedLines = lines.slice(start - 1, end);
+      let content = "";
+      let contentBytes = 0;
+      let byteTruncated = false;
+      for (const line of selectedLines) {
+        const separator = content ? "\n" : "";
+        const addition = separator + line;
+        const additionBytes = Buffer.byteLength(addition, "utf8");
+        if (contentBytes + additionBytes <= MAX_READ_BYTES) {
+          content += addition;
+          contentBytes += additionBytes;
+          continue;
+        }
+        byteTruncated = true;
+        for (const character of addition) {
+          const characterBytes = Buffer.byteLength(character, "utf8");
+          if (contentBytes + characterBytes > MAX_READ_BYTES) break;
+          content += character;
+          contentBytes += characterBytes;
+        }
+        break;
+      }
       return {
         content: {
           path: relativePath(root, path),
@@ -147,7 +187,7 @@ export const readFileTool: Tool = {
           endLine: end,
           totalLines,
           content,
-          truncated: end < totalLines && (requestedEnd === undefined || (requestedEnd as number) > end)
+          truncated: byteTruncated || (end < totalLines && (requestedEnd === undefined || (requestedEnd as number) > end))
         },
         isError: false
       };

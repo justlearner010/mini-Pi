@@ -36,7 +36,7 @@ test("scan discovers README, manifests, supported files, and stable ordering", a
   assert.equal(result.readmePath, "README.md");
   assert.deepEqual(result.manifestPaths, ["package.json", "tsconfig.json"]);
   assert.deepEqual(result.sourceFiles, ["a.py", "z.ts"]);
-  assert.deepEqual(result.tree, ["README.md", "a.py", "data/config.json", "notes/idea.md", "package.json", "tsconfig.json", "z.ts"]);
+  assert.equal(result.tree, "README.md\na.py\ndata/config.json\nnotes/idea.md\npackage.json\ntsconfig.json\nz.ts");
   assert.equal(result.totalRelevantFiles, 7);
   assert.equal(result.returnedFileCount, 7);
   assert.equal(result.truncated, false);
@@ -57,7 +57,7 @@ test("scan ignores build artifacts and all hidden directories", async () => {
     "coverage/out.json": "{}",
     ".cache/a.ts": ""
   }));
-  assert.deepEqual(result.tree, ["index.ts"]);
+  assert.equal(result.tree, "index.ts");
 });
 
 test("scan reports common unsupported source files separately", async () => {
@@ -73,8 +73,37 @@ test("scan returns only the first 500 sorted relevant files", async () => {
   assert.equal(result.totalRelevantFiles, 501);
   assert.equal(result.returnedFileCount, 500);
   assert.equal(result.truncated, true);
-  assert.deepEqual((result.tree as string[]).slice(0, 2), ["src/000.ts", "src/001.ts"]);
-  assert.equal((result.tree as string[]).at(-1), "src/499.ts");
+  assert.deepEqual((result.tree as string).split("\n").slice(0, 2), ["src/000.ts", "src/001.ts"]);
+  assert.equal((result.tree as string).split("\n").at(-1), "src/499.ts");
+  assert.equal((result.sourceFiles as string[]).length, 500);
+});
+
+test("scan exposes a handwritten schema and scans a requested in-root subdirectory", async () => {
+  const rootDir = await project({ "outside.ts": "", "nested/inside.ts": "", "nested/tsconfig.app.json": "{}" });
+  assert.deepEqual(scanProjectTool.parameters, {
+    type: "object",
+    properties: { path: { type: "string", description: "Optional relative directory to scan" } },
+    additionalProperties: false
+  });
+  const result = await scanProjectTool.execute({ path: "nested" }, { rootDir });
+  assert.equal(result.isError, false);
+  assert.deepEqual(result.content, {
+    scannedPath: "nested",
+    readmePath: null,
+    manifestPaths: ["tsconfig.app.json"],
+    sourceFiles: ["inside.ts"],
+    unsupportedFiles: [],
+    tree: "inside.ts\ntsconfig.app.json",
+    totalRelevantFiles: 2,
+    returnedFileCount: 2,
+    truncated: false
+  });
+});
+
+test("scan rejects non-string and escaping paths", async () => {
+  const rootDir = await project({ "safe.ts": "" });
+  assert.equal((await scanProjectTool.execute({ path: "../outside" }, { rootDir })).isError, true);
+  assert.equal((await scanProjectTool.execute({ path: 12 }, { rootDir })).isError, true);
 });
 
 test("read rejects paths that escape the project", async () => {
@@ -111,6 +140,16 @@ test("read truncates at 300 lines when no end line is supplied", async () => {
   assert.equal((result.content as Record<string, unknown>).startLine, 1);
   assert.equal((result.content as Record<string, unknown>).endLine, 300);
   assert.equal((result.content as Record<string, unknown>).truncated, true);
+});
+
+test("read truncates text output at 256 KB without splitting UTF-8 characters", async () => {
+  const rootDir = await project({ "large.txt": "你".repeat(100_000) });
+  const result = await readFileTool.execute({ path: "large.txt" }, { rootDir });
+  assert.equal(result.isError, false);
+  const content = result.content as Record<string, unknown>;
+  assert.equal(content.truncated, true);
+  assert.ok(Buffer.byteLength(content.content as string, "utf8") <= 256 * 1024);
+  assert.match(content.content as string, /你$/);
 });
 
 test("read rejects binary and non-existent files", async () => {
