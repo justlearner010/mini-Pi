@@ -35,7 +35,8 @@ test("scan discovers README, manifests, supported files, and stable ordering", a
   const result = await scan(rootDir);
   assert.equal(result.readmePath, "README.md");
   assert.deepEqual(result.manifestPaths, ["package.json", "tsconfig.json"]);
-  assert.deepEqual(result.sourceFiles, ["a.py", "z.ts"]);
+  assert.deepEqual(result.sourceFiles, ["z.ts"]);
+  assert.deepEqual(result.unsupportedFiles, ["a.py"]);
   assert.equal(result.tree, "README.md\na.py\ndata/config.json\nnotes/idea.md\npackage.json\ntsconfig.json\nz.ts");
   assert.equal(result.totalRelevantFiles, 7);
   assert.equal(result.returnedFileCount, 7);
@@ -61,9 +62,9 @@ test("scan ignores build artifacts and all hidden directories", async () => {
 });
 
 test("scan reports common unsupported source files separately", async () => {
-  const result = await scan(await project({ "main.ts": "", "native.rs": "", "web.go": "", "app.java": "" }));
+  const result = await scan(await project({ "main.ts": "", "script.py": "", "native.rs": "", "web.go": "", "app.java": "" }));
   assert.deepEqual(result.sourceFiles, ["main.ts"]);
-  assert.deepEqual(result.unsupportedFiles, ["app.java", "native.rs", "web.go"]);
+  assert.deepEqual(result.unsupportedFiles, ["app.java", "native.rs", "script.py", "web.go"]);
 });
 
 test("scan returns only the first 500 sorted relevant files", async () => {
@@ -112,11 +113,27 @@ test("read rejects paths that escape the project", async () => {
   assert.equal(result.isError, true);
 });
 
+test("read rejects nested traversal and paths in a same-prefix sibling directory", async () => {
+  const rootDir = await project({ "nested/safe.txt": "ok" });
+  const sibling = `${rootDir}-sibling`;
+  await mkdir(sibling);
+  await writeFile(join(sibling, "secret.txt"), "secret");
+  assert.equal((await readFileTool.execute({ path: "nested/../../outside.txt" }, { rootDir })).isError, true);
+  assert.equal((await readFileTool.execute({ path: `../${sibling.split("/").at(-1)}/secret.txt` }, { rootDir })).isError, true);
+});
+
 test("read rejects symlink paths even when their target is inside the project", async () => {
   const rootDir = await project({ "safe.txt": "ok" });
   await symlink(join(rootDir, "safe.txt"), join(rootDir, "link.txt"));
   const result = await readFileTool.execute({ path: "link.txt" }, { rootDir });
   assert.equal(result.isError, true);
+});
+
+test("read rejects symlinks whose target is outside the project", async () => {
+  const rootDir = await project({ "safe.txt": "ok" });
+  const outside = await project({ "secret.txt": "secret" });
+  await symlink(join(outside, "secret.txt"), join(rootDir, "outside-link.txt"));
+  assert.equal((await readFileTool.execute({ path: "outside-link.txt" }, { rootDir })).isError, true);
 });
 
 test("read returns complete small text files with line metadata", async () => {
@@ -152,10 +169,32 @@ test("read truncates text output at 256 KB without splitting UTF-8 characters", 
   assert.match(content.content as string, /你$/);
 });
 
+test("read observes exact 255 KB, 256 KB, and 257 KB byte boundaries", async () => {
+  const rootDir = await project({
+    "255.txt": "x".repeat(255 * 1024),
+    "256.txt": "x".repeat(256 * 1024),
+    "257.txt": "x".repeat(257 * 1024)
+  });
+  for (const [path, expectedTruncated, expectedBytes] of [["255.txt", false, 255 * 1024], ["256.txt", false, 256 * 1024], ["257.txt", true, 256 * 1024]] as const) {
+    const result = await readFileTool.execute({ path }, { rootDir });
+    assert.equal(result.isError, false);
+    const content = result.content as Record<string, unknown>;
+    assert.equal(content.truncated, expectedTruncated);
+    assert.equal(Buffer.byteLength(content.content as string, "utf8"), expectedBytes);
+  }
+});
+
 test("read rejects binary and non-existent files", async () => {
-  const rootDir = await project({ "image.bin": Buffer.from([0, 1, 2]), "exists.txt": "yes" });
+  const rootDir = await project({ "image.bin": Buffer.from([0, 1, 2]), "jpeg.bin": Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0x11, 0x22]), "exists.txt": "yes" });
   const binary = await readFileTool.execute({ path: "image.bin" }, { rootDir });
+  const jpeg = await readFileTool.execute({ path: "jpeg.bin" }, { rootDir });
   const missing = await readFileTool.execute({ path: "missing.txt" }, { rootDir });
   assert.equal(binary.isError, true);
+  assert.equal(jpeg.isError, true);
   assert.equal(missing.isError, true);
+});
+
+test("read rejects unknown arguments", async () => {
+  const result = await readFileTool.execute({ path: "safe.txt", unexpected: true }, { rootDir: await project({ "safe.txt": "ok" }) });
+  assert.equal(result.isError, true);
 });

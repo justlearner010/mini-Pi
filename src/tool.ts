@@ -18,8 +18,8 @@ export interface Tool {
 }
 
 const IGNORED_DIRECTORIES = new Set(["node_modules", ".git", "dist", "build", "coverage"]);
-const SUPPORTED_SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py"]);
-const UNSUPPORTED_SOURCE_EXTENSIONS = new Set([".rs", ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".cs", ".swift", ".kt", ".scala"]);
+const SUPPORTED_SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+const UNSUPPORTED_SOURCE_EXTENSIONS = new Set([".py", ".rs", ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".cs", ".swift", ".kt", ".scala"]);
 const MAX_SCAN_FILES = 500;
 const MAX_READ_LINES = 300;
 const MAX_READ_BYTES = 256 * 1024;
@@ -61,6 +61,15 @@ async function safeProjectPath(rootDir: string, input: string): Promise<{ root: 
 
 function relativePath(root: string, path: string): string {
   return relative(root, path).split(sep).join("/");
+}
+
+function decodeText(bytes: Buffer): string {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if ([...text].some((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return (code < 32 && code !== 9 && code !== 10 && code !== 13) || code === 127;
+  })) throw new Error("Binary files cannot be read");
+  return text;
 }
 
 function relevantKind(path: string): "readme" | "manifest" | "source" | "unsupported" | "document" | undefined {
@@ -141,14 +150,13 @@ export const readFileTool: Tool = {
   },
   async execute(args, context) {
     try {
-      if (!args || typeof args !== "object" || !("path" in args) || typeof args.path !== "string") throw new Error("A relative file path is required");
+      if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some((key) => key !== "path" && key !== "startLine" && key !== "endLine") || !("path" in args) || typeof args.path !== "string") throw new Error("Arguments must contain only path, startLine, and endLine");
       const { path: requestedPath, startLine, endLine } = args as { path: string; startLine?: unknown; endLine?: unknown };
       const { root, path } = await safeProjectPath(context.rootDir, requestedPath);
       const file = await lstat(path);
       if (!file.isFile()) throw new Error("Path is not a file");
       const bytes = await readFile(path);
-      if (bytes.includes(0)) throw new Error("Binary files cannot be read");
-      const text = bytes.toString("utf8");
+      const text = decodeText(bytes);
       const lines = text.split("\n");
       if (text.endsWith("\n")) lines.pop();
       const totalLines = lines.length;
