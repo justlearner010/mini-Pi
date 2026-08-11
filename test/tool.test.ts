@@ -283,6 +283,18 @@ test("dependency analysis reports canonical deduplicated self, two-node, and mul
   ]);
 });
 
+test("dependency analysis finds overlapping simple cycles from the same graph", async () => {
+  const result = await analyze(await project({
+    "a.ts": 'import "./b"; import "./c";',
+    "b.ts": 'import "./c";',
+    "c.ts": 'import "./a";'
+  }));
+  assert.deepEqual(result.cycles, [
+    ["a.ts", "b.ts", "c.ts", "a.ts"],
+    ["a.ts", "c.ts", "a.ts"]
+  ]);
+});
+
 test("dependency analysis caps returned edges while preserving stable total counts", async () => {
   const files: Record<string, string> = { "main.ts": Array.from({ length: 501 }, (_, i) => `import "./parts/${i}";`).join("\n") };
   for (let i = 0; i < 501; i += 1) files[`parts/${i}.ts`] = "";

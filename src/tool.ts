@@ -26,6 +26,7 @@ const MAX_SCAN_FILES = 500;
 const MAX_READ_LINES = 300;
 const MAX_READ_BYTES = 256 * 1024;
 const MAX_DEPENDENCY_EDGES = 500;
+const MAX_DEPENDENCY_CYCLES = 500;
 const RESOLVABLE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 const BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, "")));
 
@@ -265,26 +266,30 @@ function canonicalCycle(cycle: string[]): string[] {
   return [...variants[0], variants[0][0]];
 }
 
-function findCycles(files: string[], edges: DependencyEdge[]): string[][] {
-  const adjacency = new Map(files.map((file) => [file, [] as string[]]));
-  for (const edge of edges) adjacency.get(edge.from)?.push(edge.to);
-  for (const paths of adjacency.values()) paths.sort((left, right) => left.localeCompare(right));
-  const visited = new Set<string>();
-  const stack: string[] = [];
-  const active = new Set<string>();
+function findCycles(files: string[], edges: DependencyEdge[]): { cycles: string[][]; truncated: boolean } {
+  const adjacency = new Map(files.map((file) => [file, new Set<string>()]));
+  for (const edge of edges) adjacency.get(edge.from)?.add(edge.to);
   const cycles = new Map<string, string[]>();
-  const visit = (file: string) => {
-    visited.add(file); active.add(file); stack.push(file);
-    for (const next of adjacency.get(file) ?? []) {
-      if (active.has(next)) {
-        const cycle = canonicalCycle([...stack.slice(stack.indexOf(next)), next]);
-        cycles.set(cycle.join("\0"), cycle);
-      } else if (!visited.has(next)) visit(next);
-    }
-    stack.pop(); active.delete(file);
-  };
-  for (const file of files) if (!visited.has(file)) visit(file);
-  return [...cycles.values()].sort((left, right) => left.join("\0").localeCompare(right.join("\0")));
+  let truncated = false;
+  for (const start of files) {
+    const path = [start];
+    const active = new Set(path);
+    const visit = (file: string) => {
+      for (const next of [...(adjacency.get(file) ?? [])].sort((left, right) => left.localeCompare(right))) {
+        if (next === start) {
+          const cycle = canonicalCycle([...path, start]);
+          if (cycles.size === MAX_DEPENDENCY_CYCLES) { truncated = true; return; }
+          cycles.set(cycle.join("\0"), cycle);
+        } else if (next.localeCompare(start) > 0 && !active.has(next)) {
+          active.add(next); path.push(next); visit(next); path.pop(); active.delete(next);
+          if (truncated) return;
+        }
+      }
+    };
+    visit(start);
+    if (truncated) break;
+  }
+  return { cycles: [...cycles.values()].sort((left, right) => left.join("\0").localeCompare(right.join("\0"))), truncated };
 }
 
 function buildEntryTree(entry: string, edges: DependencyEdge[]): string {
@@ -356,10 +361,11 @@ export const analyzeDependenciesTool: Tool = {
       packages.sort((left, right) => left.from.localeCompare(right.from) || left.packageName.localeCompare(right.packageName) || left.specifier.localeCompare(right.specifier));
       unresolved.sort(compareDependency);
       const returnedEdges = edges.slice(0, MAX_DEPENDENCY_EDGES);
+      const cycleResult = findCycles(analyzedFiles, edges);
       return { content: {
         analyzedPath: relativePath(root, scanPath) || ".", entry: entry ?? null, analyzedFiles, unsupportedFiles, edges: returnedEdges, builtins, packages, unresolved,
-        cycles: findCycles(analyzedFiles, edges), entryTree: entry ? buildEntryTree(entry, edges) : null,
-        analyzedFileCount: analyzedFiles.length, totalEdgeCount: edges.length, returnedEdgeCount: returnedEdges.length, truncated: edges.length > returnedEdges.length
+        cycles: cycleResult.cycles, entryTree: entry ? buildEntryTree(entry, edges) : null,
+        analyzedFileCount: analyzedFiles.length, totalEdgeCount: edges.length, returnedEdgeCount: returnedEdges.length, truncated: edges.length > returnedEdges.length || cycleResult.truncated
       }, isError: false };
     } catch (error) {
       return { content: error instanceof Error ? error.message : "Unable to analyze dependencies", isError: true };
