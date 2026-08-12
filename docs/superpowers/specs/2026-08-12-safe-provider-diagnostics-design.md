@@ -28,7 +28,6 @@
   advice: string,
   status?: number,
   code?: string,
-  requestId?: string
 }
 ```
 
@@ -60,10 +59,10 @@
 运行 `MINI_PI_DEBUG=1 mini-pi .` 时，默认诊断后可追加：
 
 ```text
-调试：HTTP 401 · code=invalid_api_key · requestId=abc123
+调试：HTTP 401 · code=invalid_api_key
 ```
 
-无论模式都禁止打印：API Key（含片段）、Authorization/其他请求头、请求或响应完整正文、聊天内容、文件内容、工具结果、堆栈。
+原始 Provider 错误码和 request ID 也不可信：仅允许固定白名单的通用错误码，完全不显示 request ID。无论模式都禁止打印：API Key（含片段）、Authorization/其他请求头、请求或响应完整正文、聊天内容、文件内容、工具结果、堆栈。
 
 `MINI_PI_DEBUG` 仅在值严格等于 `1` 时开启。第一版不增加 `/debug`、文件日志、自动重试、自动模型回退或上报错误。
 
@@ -74,7 +73,7 @@ Provider SDK error
   → llm.ts：安全分类为 ProviderDiagnostic
   → agent.ts：model-stage AgentEvent
   → tui.ts：中文原因与建议
-  → debug 开关：仅追加 status / code / requestId
+  → debug 开关：仅追加 status / 白名单 code
 ```
 
 既有工具错误和最大回合错误维持原行为；只有模型/Provider 失败走新诊断路径。
@@ -85,7 +84,7 @@ Provider SDK error
 
 - 401、403、404、429、5xx、网络、未知错误的 kind、级别、中文原因与建议；
 - 默认展示不包含 Key、请求头、请求/响应正文；
-- `MINI_PI_DEBUG=1` 只显示 status、code、requestId，其他值不触发；
+- `MINI_PI_DEBUG=1` 只显示 status 和白名单 code；不显示 request ID；
 - AgentEvent 保留阶段与诊断，TUI 正确格式化；
 - 旧工具错误、最大回合错误与成功调用不回归。
 

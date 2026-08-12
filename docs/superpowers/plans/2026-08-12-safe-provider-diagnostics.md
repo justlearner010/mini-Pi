@@ -4,7 +4,7 @@
 
 **Goal:** Replace generic model failures with safe Chinese diagnostics and optional `MINI_PI_DEBUG=1` evidence, without logging secrets or project content.
 
-**Architecture:** `llm.ts` creates a typed `ProviderDiagnostic` from only status/code/request ID and known network signals. `agent.ts` transports it in a model error event, while `tui.ts` renders Chinese reason/advice and conditionally appends the three safe debug fields. `cli.ts` enables that rendering only when `MINI_PI_DEBUG === "1"`.
+**Architecture:** `llm.ts` creates a typed `ProviderDiagnostic` from status, an allowlisted generic error code, and known network signals. `agent.ts` transports it in a model error event, while `tui.ts` renders Chinese reason/advice and conditionally appends safe status/code fields. `cli.ts` enables that rendering only when `MINI_PI_DEBUG === "1"`.
 
 **Tech Stack:** TypeScript, Node.js 22, OpenAI-compatible SDK, `node:test`.
 
@@ -26,7 +26,7 @@
 ```ts
 test("classifies a 401 without exposing secret response text", async () => {
   const error = Object.assign(new Error("Authorization: Bearer secret"), {
-    status: 401, code: "invalid_api_key", request_id: "req_1"
+    status: 401, code: "invalid_api_key"
   });
   await assert.rejects(() => failingLLM(error).generate([], []), (failure: ProviderDiagnostic) => {
     assert.equal(failure.kind, "authentication");
@@ -37,10 +37,10 @@ test("classifies a 401 without exposing secret response text", async () => {
 });
 
 test("renders model diagnostics in Chinese and only adds safe debug fields", () => {
-  const event = diagnosticEvent({ status: 429, code: "rate_limit", requestId: "req_2" });
+  const event = diagnosticEvent({ status: 429, code: "rate_limit_exceeded" });
   assert.match(formatEvent(event), /限流/);
   assert(!formatEvent(event).includes("req_2"));
-  assert.match(formatEvent(event, true), /HTTP 429.*code=rate_limit.*requestId=req_2/);
+  assert.match(formatEvent(event, true), /HTTP 429.*code=rate_limit_exceeded/);
 });
 ```
 
@@ -51,11 +51,11 @@ Expected: FAIL because `ProviderDiagnostic` and diagnostic event fields do not e
 
 - [ ] **Step 3: Implement the minimal diagnostic flow**
 
-In `llm.ts`, export a `ProviderDiagnostic` error subtype carrying only `level`, `kind`, `provider`, Chinese `message`/`advice`, and optional `status`, `code`, `requestId`. Read only known scalar SDK fields (`status`, `code`, `request_id` or `requestId`); map 401, 403, 404, 429, 5xx, and network-like codes/messages. Never include original exception text.
+In `llm.ts`, export a `ProviderDiagnostic` error subtype carrying only `level`, `kind`, `provider`, Chinese `message`/`advice`, and optional `status` plus an allowlisted generic `code`. Map 401, 403, 404, 429, 5xx, and network-like codes/messages. Never include original exception text or request IDs.
 
 In `agent.ts`, preserve a caught `ProviderDiagnostic` as a model-stage error event; keep existing generic error behavior for non-diagnostic model errors and all tool/turn failures.
 
-In `tui.ts`, format the event as Chinese label/location/reason/advice. Accept a `debug = false` flag and append exactly `HTTP <status>`, `code=<code>`, and `requestId=<requestId>` only when true. In `cli.ts`, pass `env.MINI_PI_DEBUG === "1"` to the event formatter.
+In `tui.ts`, format the event as Chinese label/location/reason/advice. Accept a `debug = false` flag and append only `HTTP <status>` plus an allowlisted `code=<code>` when true. In `cli.ts`, pass `env.MINI_PI_DEBUG === "1"` to the event formatter.
 
 - [ ] **Step 4: Add full category and transport regressions**
 

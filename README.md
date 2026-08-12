@@ -80,7 +80,7 @@ OPENAI_API_KEY="..." npm run dev -- ../my-project \
 MINI_PI_DEBUG=1 npm run dev -- ../my-project
 ```
 
-调试模式只额外显示 HTTP 状态码、Provider 错误码与 request ID；不会显示 API Key、请求头、聊天/文件/工具内容或完整响应。
+调试模式只额外显示 HTTP 状态码与经过白名单筛选的 Provider 错误码；原始 request ID 不可信，因此不会显示。它同样不会显示 API Key、请求头、聊天/文件/工具内容或完整响应。
 
 ## 安全与边界
 
