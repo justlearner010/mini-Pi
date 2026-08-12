@@ -1,5 +1,6 @@
 {
   "name": "mini-pi",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "bin": { "mini-pi": "./dist/src/cli.js" },
@@ -9,6 +10,7 @@
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/**/*.test.ts",
     "verify:bin": "node scripts/verify-bin.mjs",
+    "verify:package": "rm -rf dist && npm run build && npm pack --dry-run",
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
