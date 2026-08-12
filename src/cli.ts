@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { parseArgs as nodeParseArgs } from "node:util";
-import { mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import keytar from "@github/keytar";
 
 import { Agent, type AgentEvent } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
@@ -22,7 +23,18 @@ export type GlobalPreference = { provider: ProviderName; model: string };
 export type KeySource = "environment" | "credential-store";
 export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
 export const CREDENTIAL_SERVICE = "mini-Pi";
-export const systemCredentials: CredentialStore = keytar;
+const require = createRequire(import.meta.url);
+
+export function createSystemCredentialStore(load: () => CredentialStore = () => require("@github/keytar") as CredentialStore): CredentialStore {
+  let store: CredentialStore | undefined;
+  const getStore = (): CredentialStore => store ??= load();
+  return {
+    getPassword: (service, account) => getStore().getPassword(service, account),
+    setPassword: (service, account, password) => getStore().setPassword(service, account, password),
+    deletePassword: (service, account) => getStore().deletePassword(service, account)
+  };
+}
+export const systemCredentials = createSystemCredentialStore();
 
 function environmentName(provider: ProviderName): "OPENAI_API_KEY" | "DEEPSEEK_API_KEY" {
   return provider === "openai" ? "OPENAI_API_KEY" : "DEEPSEEK_API_KEY";
@@ -54,13 +66,15 @@ export async function readGlobalPreference(configPath = defaultConfigPath()): Pr
 export async function saveGlobalPreference(preference: GlobalPreference, configPath = defaultConfigPath()): Promise<void> {
   if (!hasPreferenceFields(preference)) throw new Error("Invalid global preference");
   const directory = dirname(configPath);
-  const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+  const temporary = `${configPath}.${randomUUID()}.tmp`;
   try {
     await mkdir(directory, { recursive: true });
     await writeFile(temporary, `${JSON.stringify({ provider: preference.provider, model: preference.model })}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(temporary, configPath);
   } catch {
     throw new Error("Unable to save global preference");
+  } finally {
+    await unlink(temporary).catch(() => undefined);
   }
 }
 

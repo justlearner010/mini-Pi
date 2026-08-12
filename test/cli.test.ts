@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
   completeInteractiveOptions,
+  createSystemCredentialStore,
   exitCodeFor,
   getStartupSelection,
   parseArgs,
@@ -136,6 +137,14 @@ test("environment keys override stored credentials without modifying them", asyn
   assert.equal(await credentials.getPassword("mini-Pi", "openai"), "stored-key");
 });
 
+test("environment keys work when the native credential store cannot load", async () => {
+  const unavailable = createSystemCredentialStore(() => { throw new Error("native addon unavailable"); });
+  assert.deepEqual(await resolveApiKey("openai", unavailable, { OPENAI_API_KEY: "environment-key" }), {
+    apiKey: "environment-key", source: "environment"
+  });
+  assert.equal(await resolveApiKey("openai", unavailable, {}), undefined);
+});
+
 test("a saved preference and matching credential provide direct startup selection", async () => {
   const configPath = await tempConfigPath();
   await saveGlobalPreference({ provider: "deepseek", model: "deepseek-chat" }, configPath);
@@ -164,4 +173,12 @@ test("global preferences reject extra fields and never serialize an api key", as
   assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { provider: "openai", model: "gpt" });
   await writeFile(configPath, '{"provider":"openai","model":"gpt","apiKey":"must-not-read"}', "utf8");
   assert.equal(await readGlobalPreference(configPath), undefined);
+});
+
+test("a failed preference save removes its temporary file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mini-pi-cli-"));
+  const configPath = join(directory, "config.json");
+  await mkdir(configPath);
+  await assert.rejects(saveGlobalPreference({ provider: "openai", model: "gpt" }, configPath));
+  assert.deepEqual(await readdir(directory), ["config.json"]);
 });
