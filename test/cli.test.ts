@@ -21,7 +21,58 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, startTui, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, type TuiRuntime } from "../src/tui.js";
+
+test("renders common Markdown answer text without leaving formatting markers", () => {
+  const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
+  for (const text of ["Heading", "bold", "italic", "code", "item", "const value = 1;", "link", "row", "cell"]) assert.match(rendered, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert(!rendered.includes("**bold**"));
+  assert(!rendered.includes("*italic*"));
+  assert(!rendered.includes("`code`"));
+});
+
+test("removes model terminal controls before rendering", () => {
+  let received = "";
+  const rendered = renderMarkdown("\u001b]0;bad-title\u0007# Safe\u001b[2J\u001b]8;;https://bad\u001b\\link\u001b]8;;\u001b\\\u009b31m\u0000ok\u0009tab\nnext", (text) => { received = text; return text; });
+  assert.equal(received, "# Safelinkok\ttab\nnext");
+  assert.equal(rendered, received);
+  assert(!rendered.includes("\u001b") && !rendered.includes("\u009b") && !rendered.includes("\u0000"));
+});
+
+test("TUI renders only final answers and falls back to safe plain text", async () => {
+  const output: string[] = [];
+  const inputs = ["question", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); },
+    renderMarkdown: () => { throw new Error("renderer internals: secret"); }
+  };
+  const agent = {
+    reset() {},
+    async run() { return { answer: "# Safe\u001b[2J\n\n**answer**", messages: [], turns: 1 }; }
+  } as never;
+  assert.equal(await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime), 0);
+  const text = output.join("");
+  assert.match(text, /Markdown rendering failed; showing safe plain text\./);
+  assert.match(text, /# Safe\n\n\*\*answer\*\*/);
+  assert(!text.includes("renderer internals") && !text.includes("secret"));
+  assert(!text.includes("\u001b[2J"));
+});
+
+test("TUI does not send agent errors through the Markdown renderer", async () => {
+  const output: string[] = [];
+  let renders = 0;
+  const inputs = ["question", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); },
+    renderMarkdown: (text) => { renders += 1; return `rendered:${text}`; }
+  };
+  const agent = { reset() {}, async run() { throw new Error("tool error: **not markdown**"); } } as never;
+  await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime);
+  assert.equal(renders, 0);
+  assert(output.join("").includes("Error: tool error: **not markdown**"));
+});
 
 test("interactive command releases its prompt and returns to the next prompt", async () => {
   const inputs = ["/login", "/model", "/logout", "/exit"];

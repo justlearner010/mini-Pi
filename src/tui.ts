@@ -2,6 +2,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import select from "@inquirer/select";
 import password from "@inquirer/password";
+import { render as renderWithMarkdansi } from "markdansi";
 
 import type { Agent, AgentEvent } from "./agent.js";
 import type { ProviderName } from "./llm.js";
@@ -10,7 +11,21 @@ export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" |
 export type TuiSession = { agent: Agent; provider: ProviderName; model: string };
 export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined> };
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
-export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void };
+export type MarkdownRenderer = (text: string) => string;
+export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
+
+/** Removes terminal control input from untrusted model text while retaining layout. */
+export function sanitizeMarkdown(text: string): string {
+  return text
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
+    .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
+export function renderMarkdown(text: string, renderer: MarkdownRenderer = renderWithMarkdansi): string {
+  return renderer(sanitizeMarkdown(text));
+}
 
 export function parseCommand(input: string): TuiCommand {
   const text = input.trim();
@@ -83,7 +98,11 @@ export async function startTui(agent: Agent, config: { project: string; provider
         continue;
       }
       if (command.type !== "prompt") continue;
-      try { const result = await session.agent.run(command.prompt); write(`${result.answer}\n`); }
+      try {
+        const result = await session.agent.run(command.prompt);
+        try { write(`${renderMarkdown(result.answer, runtime.renderMarkdown)}\n`); }
+        catch { write(`Markdown rendering failed; showing safe plain text.\n${sanitizeMarkdown(result.answer)}\n`); }
+      }
       catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
   }
 }
