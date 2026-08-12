@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseArgs, validateOptions } from "../src/cli.js";
-import { formatEvent, parseCommand } from "../src/tui.js";
+import { completeInteractiveOptions, exitCodeFor, parseArgs, SYSTEM_PROMPT, validateOptions } from "../src/cli.js";
+import { formatEvent, helpText, parseCommand } from "../src/tui.js";
 
 test("parseArgs recognizes help, version, provider, model, prompt, and project", () => {
   assert.deepEqual(parseArgs(["demo", "--provider", "openai", "--model", "gpt-4.1", "--prompt", "hi"]), {
@@ -52,4 +52,38 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "model_start", turn: 2 }), "Thinking (turn 2)...");
   assert.equal(formatEvent({ type: "tool_end", turn: 1, toolCallId: "x", toolName: "read_file", isError: false, message: "completed" }), "✓ read_file");
   assert.equal(formatEvent({ type: "error", stage: "model", message: "Model request failed" }), "Error: Model request failed");
+});
+
+test("interactive completion uses provider models unless a model was supplied", async () => {
+  const initial = await validateOptions(parseArgs([".", "--provider", "openai"]), { OPENAI_API_KEY: "key" }, process.cwd());
+  const complete = await completeInteractiveOptions(initial, {
+    chooseProvider: async () => "deepseek", chooseModel: async (models) => models[0], listModels: async () => ["z", "a"]
+  });
+  assert.equal(complete.model, "z");
+  assert.equal(complete.error, undefined);
+  const supplied = await completeInteractiveOptions({ ...initial, model: "manual" }, {
+    chooseProvider: async () => "openai", chooseModel: async () => "bad", listModels: async () => { throw new Error("must not list"); }
+  });
+  assert.equal(supplied.model, "manual");
+});
+
+test("interactive completion reports model listing failures and empty lists", async () => {
+  const initial = await validateOptions(parseArgs([".", "--provider", "openai"]), { OPENAI_API_KEY: "key" }, process.cwd());
+  const failure = await completeInteractiveOptions(initial, { chooseProvider: async () => "openai", chooseModel: async () => "", listModels: async () => { throw new Error("nope"); } });
+  assert.match(failure.error ?? "", /pass --model/);
+  const empty = await completeInteractiveOptions(initial, { chooseProvider: async () => "openai", chooseModel: async () => "", listModels: async () => [] });
+  assert.match(empty.error ?? "", /pass --model/);
+});
+
+test("help identifies the active project provider and model, and system prompt is exact", () => {
+  assert.match(helpText("/project", "openai", "gpt"), /Project: \/project/);
+  assert.match(helpText("/project", "openai", "gpt"), /Provider: openai/);
+  assert.match(helpText("/project", "openai", "gpt"), /Model: gpt/);
+  assert.match(SYSTEM_PROMPT, /Use tools to gather evidence before making claims/);
+  assert.match(SYSTEM_PROMPT, /Answer in the user's language/);
+});
+
+test("prompt cancellation maps to the conventional Ctrl+C exit status", () => {
+  assert.equal(exitCodeFor({ name: "ExitPromptError" }), 130);
+  assert.equal(exitCodeFor(new Error("other")), 1);
 });

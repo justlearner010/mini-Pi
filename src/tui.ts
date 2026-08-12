@@ -30,19 +30,24 @@ export async function chooseProvider(): Promise<ProviderName> {
   return select({ message: "Provider", choices: [{ name: "OpenAI", value: "openai" }, { name: "DeepSeek", value: "deepseek" }] });
 }
 
-export async function chooseModel(provider: ProviderName): Promise<string> {
-  const models = provider === "openai" ? ["gpt-4.1-mini", "gpt-4.1"] : ["deepseek-chat", "deepseek-reasoner"];
+export async function chooseModel(models: string[]): Promise<string> {
   return select({ message: "Model", choices: models.map((value) => ({ name: value, value })) });
 }
 
-export async function startTui(agent: Agent): Promise<void> {
+export function helpText(project: string, provider: ProviderName, model: string): string {
+  return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /help, /reset, /exit`;
+}
+
+export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }): Promise<number> {
   const line = createInterface({ input: stdin, output: stdout });
   stdout.write("mini-Pi ready. /help for commands.\n");
   try {
     while (true) {
-      const command = parseCommand(await line.question("> "));
-      if (command.type === "exit") return;
-      if (command.type === "help") { stdout.write("Ask about the project. Commands: /help, /reset, /exit\n"); continue; }
+      let input: string;
+      try { input = await line.question("> "); } catch { return 0; }
+      const command = parseCommand(input);
+      if (command.type === "exit") return 0;
+      if (command.type === "help") { stdout.write(`${helpText(config.project, config.provider, config.model)}\n`); continue; }
       if (command.type === "reset") { agent.reset(); stdout.write("Conversation reset.\n"); continue; }
       if (command.type === "empty") { stdout.write("Enter a question or /help.\n"); continue; }
       if (command.type === "unknown") { stdout.write(`Unknown command: ${command.command}\n`); continue; }
