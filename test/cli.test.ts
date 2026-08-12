@@ -157,3 +157,11 @@ test("missing or malformed preferences safely produce no startup selection", asy
   assert.equal(await readGlobalPreference(invalid), undefined);
   assert.equal(await getStartupSelection(fakeCredentials({ openai: "secret" }), invalid, {}), undefined);
 });
+
+test("global preferences reject extra fields and never serialize an api key", async () => {
+  const configPath = await tempConfigPath();
+  await saveGlobalPreference({ provider: "openai", model: "gpt", apiKey: "must-not-persist" } as never, configPath);
+  assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { provider: "openai", model: "gpt" });
+  await writeFile(configPath, '{"provider":"openai","model":"gpt","apiKey":"must-not-read"}', "utf8");
+  assert.equal(await readGlobalPreference(configPath), undefined);
+});

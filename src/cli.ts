@@ -34,7 +34,14 @@ export function defaultConfigPath(home = homedir()): string {
 
 function isPreference(value: unknown): value is GlobalPreference {
   const item = value as { provider?: unknown; model?: unknown };
-  return (item?.provider === "openai" || item?.provider === "deepseek") && typeof item.model === "string" && item.model.length > 0;
+  return typeof value === "object" && value !== null && Object.keys(value).length === 2 && Object.keys(value).every((key) => key === "provider" || key === "model")
+    && (item.provider === "openai" || item.provider === "deepseek") && typeof item.model === "string" && item.model.length > 0;
+}
+
+function hasPreferenceFields(value: unknown): value is GlobalPreference {
+  const item = value as { provider?: unknown; model?: unknown };
+  return typeof value === "object" && value !== null && (item.provider === "openai" || item.provider === "deepseek")
+    && typeof item.model === "string" && item.model.length > 0;
 }
 
 export async function readGlobalPreference(configPath = defaultConfigPath()): Promise<GlobalPreference | undefined> {
@@ -45,12 +52,12 @@ export async function readGlobalPreference(configPath = defaultConfigPath()): Pr
 }
 
 export async function saveGlobalPreference(preference: GlobalPreference, configPath = defaultConfigPath()): Promise<void> {
-  if (!isPreference(preference)) throw new Error("Invalid global preference");
+  if (!hasPreferenceFields(preference)) throw new Error("Invalid global preference");
   const directory = dirname(configPath);
   const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
   try {
     await mkdir(directory, { recursive: true });
-    await writeFile(temporary, `${JSON.stringify(preference)}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporary, `${JSON.stringify({ provider: preference.provider, model: preference.model })}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(temporary, configPath);
   } catch {
     throw new Error("Unable to save global preference");
