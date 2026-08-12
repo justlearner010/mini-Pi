@@ -71,7 +71,7 @@ test("emits lifecycle events including tool events", async () => {
   await agent.run("go");
   assert.deepEqual(events, [
     { type: "agent_start", prompt: "go" }, { type: "model_start", turn: 1 }, { type: "model_end", turn: 1, toolCallCount: 1 },
-    { type: "tool_start", turn: 1, toolCallId: "x", toolName: "echo" }, { type: "tool_end", turn: 1, toolCallId: "x", toolName: "echo", isError: false, message: "yes" },
+    { type: "tool_start", turn: 1, toolCallId: "x", toolName: "echo" }, { type: "tool_end", turn: 1, toolCallId: "x", toolName: "echo", isError: false, message: "completed" },
     { type: "model_start", turn: 2 }, { type: "model_end", turn: 2, toolCallCount: 0 }, { type: "agent_end", answer: "done", turns: 2 }
   ]);
 });
@@ -99,7 +99,23 @@ test("reset restores only the system prompt and provider failures rollback a run
   agent.reset();
   assert.equal((await agent.run("new")).answer, "fresh");
   assert.deepEqual(fake.requests[2], [{ role: "system", content: "rules" }, { role: "user", content: "new" }]);
-  assert(events.some((event) => event.type === "error" && event.stage === "model"));
+  assert.deepEqual(events.slice(4, 7), [
+    { type: "agent_start", prompt: "rollback" }, { type: "model_start", turn: 1 }, { type: "error", stage: "model", message: "Model request failed" }
+  ]);
+});
+
+test("tool events summarize errors and never leak large tool content", async () => {
+  const large = "sensitive-content-".repeat(1000);
+  const fake = fakeLLM([response(null, [{ id: "ok", name: "large", arguments: "{}" }, { id: "bad", name: "fail", arguments: "{}" }]), response("done")]);
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ llm: fake.llm, tools: [tool("large", async () => ({ content: large, isError: false })), tool("fail", async () => ({ content: "precise failure details", isError: true }))], systemPrompt: "r", rootDir: "/p", onEvent: (event) => events.push(event) });
+  await agent.run("go");
+  const ends = events.filter((event) => event.type === "tool_end");
+  assert.deepEqual(ends, [
+    { type: "tool_end", turn: 1, toolCallId: "ok", toolName: "large", isError: false, message: "completed" },
+    { type: "tool_end", turn: 1, toolCallId: "bad", toolName: "fail", isError: true, message: "precise failure details" }
+  ]);
+  assert(!JSON.stringify(events).includes(large));
 });
 
 test("serializes null and undefined tool content safely", async () => {
