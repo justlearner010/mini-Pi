@@ -2,13 +2,13 @@
   "name": "mini-pi",
   "private": true,
   "type": "module",
-  "bin": { "mini-pi": "./dist/tool.js" },
+  "bin": { "mini-pi": "./dist/cli.js" },
   "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/**/*.test.ts",
-    "dev": "tsx src/tool.ts"
+    "dev": "tsx src/cli.ts"
   },
   "dependencies": {
     "@inquirer/select": "5.2.1",
