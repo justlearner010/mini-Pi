@@ -82,13 +82,19 @@ test("renders Chinese model diagnostics and only exposes safe debug fields", () 
   const normal = formatEvent(event);
   assert.match(normal, /警告 \[限流\][\s\S]*DeepSeek，第 2 次模型请求[\s\S]*原因：当前请求被限流/);
   assert(!normal.includes("429") && !normal.includes("rate_limit") && !normal.includes("req_2"));
-  assert.match(formatEvent(event, true), /调试：HTTP 429 · code=rate_limit · requestId=req_2/);
+  assert.match(formatEvent(event, true), /调试：HTTP 429$/);
 });
 
 test("only MINI_PI_DEBUG exactly 1 enables debug rendering", () => {
   assert.equal(debugEnabled({ MINI_PI_DEBUG: "1" }), true);
   assert.equal(debugEnabled({ MINI_PI_DEBUG: "true" }), false);
   assert.equal(debugEnabled({}), false);
+});
+
+test("debug formatting never renders provider supplied secret-like fields", () => {
+  const event = { type: "error" as const, stage: "model" as const, turn: 1, message: "Provider 请求失败", diagnostic: { level: "warning" as const, kind: "unknown" as const, provider: "openai" as const, message: "Provider 请求失败", reason: "Provider 返回了无法分类的错误。", advice: "查看调试信息或稍后重试。", status: 400, code: "api_key_SECRET", requestId: "token-super-secret" } };
+  const text = formatEvent(event, true);
+  assert(!text.includes("SECRET") && !text.includes("token-super-secret"));
 });
 
 test("interactive completion uses provider models unless a model was supplied", async () => {
