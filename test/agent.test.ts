@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Agent, type AgentEvent, type AgentResult } from "../src/agent.js";
-import type { LLMClient, Message, ModelResponse } from "../src/llm.js";
+import { ProviderDiagnostic, type LLMClient, type Message, type ModelResponse } from "../src/llm.js";
 import type { Tool } from "../src/tool.js";
 
 function response(content: string | null, toolCalls: ModelResponse["message"]["toolCalls"] = []): ModelResponse {
@@ -133,4 +133,14 @@ test("serializes null and undefined tool content safely", async () => {
   const agent = new Agent({ llm: fake.llm, tools: [tool("null", async () => ({ content: null, isError: false })), tool("undefined", async () => ({ content: undefined, isError: false }))], systemPrompt: "rules", rootDir: "/p" });
   await agent.run("go");
   assert.deepEqual(fake.requests[1].filter((message) => message.role === "tool").map((message) => (message as { content: string }).content), ["", ""]);
+});
+
+test("transports a safe provider diagnostic through the model error event", async () => {
+  const failure = new ProviderDiagnostic({ provider: "deepseek", level: "warning", kind: "rate_limit", message: "DeepSeek 请求受限", reason: "当前请求被限流、余额或并发限制。", advice: "稍后重试，或切换模型 / Provider。", status: 429, code: "rate_limit", requestId: "req_2" });
+  const fake = fakeLLM([failure]);
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ llm: fake.llm, tools: [], systemPrompt: "rules", rootDir: "/p", onEvent: (event) => events.push(event) });
+  await assert.rejects(() => agent.run("go"), /DeepSeek 请求受限/);
+  const event = events.find((item) => item.type === "error");
+  assert.deepEqual(event, { type: "error", stage: "model", turn: 1, message: "DeepSeek 请求受限", diagnostic: failure });
 });

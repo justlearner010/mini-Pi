@@ -24,6 +24,7 @@ export type GlobalPreference = { provider: ProviderName; model: string };
 export type KeySource = "environment" | "credential-store";
 export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
 export const CREDENTIAL_SERVICE = "mini-Pi";
+export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
 const require = createRequire(import.meta.url);
 
 export function createSystemCredentialStore(load: () => CredentialStore = () => require("@github/keytar") as CredentialStore): CredentialStore {
@@ -225,7 +226,7 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
     } else if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env, systemCredentials);
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: new Agent({ llm: createLLM({ provider: selection.provider, model: selection.model, apiKey }), tools, rootDir: valid.rootDir!, systemPrompt: SYSTEM_PROMPT, messages: history, onEvent: (event) => { const text = formatEvent(event); if (text) console.log(text); } }) });
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: new Agent({ llm: createLLM({ provider: selection.provider, model: selection.model, apiKey }), tools, rootDir: valid.rootDir!, systemPrompt: SYSTEM_PROMPT, messages: history, onEvent: (event) => { const text = formatEvent(event, debugEnabled(env)); if (text) console.log(text); } }) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
   if (valid.prompt) { try { console.log((await session.agent.run(valid.prompt)).answer); return 0; } catch { return 1; } }
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {

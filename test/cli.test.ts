@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   completeInteractiveOptions,
   createSystemCredentialStore,
+  debugEnabled,
   loginWithCredentialStore,
   logoutFromCredentialStore,
   exitCodeFor,
@@ -74,6 +75,20 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "tool_end", turn: 1, toolCallId: "x", toolName: "read_file", isError: false, message: "completed" }), "✓ read_file");
   assert.equal(formatEvent({ type: "error", stage: "model", message: "Model request failed" }), "Error: Model request failed");
   assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
+});
+
+test("renders Chinese model diagnostics and only exposes safe debug fields", () => {
+  const event = { type: "error" as const, stage: "model" as const, turn: 2, message: "DeepSeek 请求受限", diagnostic: { level: "warning" as const, kind: "rate_limit" as const, provider: "deepseek" as const, message: "DeepSeek 请求受限", reason: "当前请求被限流、余额或并发限制。", advice: "稍后重试，或切换模型 / Provider。", status: 429, code: "rate_limit", requestId: "req_2" } };
+  const normal = formatEvent(event);
+  assert.match(normal, /警告 \[限流\][\s\S]*DeepSeek，第 2 次模型请求[\s\S]*原因：当前请求被限流/);
+  assert(!normal.includes("429") && !normal.includes("rate_limit") && !normal.includes("req_2"));
+  assert.match(formatEvent(event, true), /调试：HTTP 429 · code=rate_limit · requestId=req_2/);
+});
+
+test("only MINI_PI_DEBUG exactly 1 enables debug rendering", () => {
+  assert.equal(debugEnabled({ MINI_PI_DEBUG: "1" }), true);
+  assert.equal(debugEnabled({ MINI_PI_DEBUG: "true" }), false);
+  assert.equal(debugEnabled({}), false);
 });
 
 test("interactive completion uses provider models unless a model was supplied", async () => {

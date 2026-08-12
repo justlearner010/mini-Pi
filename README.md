@@ -72,6 +72,16 @@ OPENAI_API_KEY="..." npm run dev -- ../my-project \
 
 环境变量 `OPENAI_API_KEY` 或 `DEEPSEEK_API_KEY` 会临时优先于系统凭据库，适合 CI、服务器或临时换 Key；它们不会覆盖已安全保存的 Key。API Key 不接受命令行参数，也不要提交到 Git。
 
+## 请求错误诊断
+
+模型请求失败时，mini-Pi 会显示中文的错误级别、Provider、回合、原因与建议。例如认证失败会提示运行 `/login` 更新 Key，限流会建议稍后重试或切换模型。若需要排查技术细节，可在启动时开启安全调试信息：
+
+```sh
+MINI_PI_DEBUG=1 npm run dev -- ../my-project
+```
+
+调试模式只额外显示 HTTP 状态码、Provider 错误码与 request ID；不会显示 API Key、请求头、聊天/文件/工具内容或完整响应。
+
 ## 安全与边界
 
 工具只能在选定项目根目录内读取文件，会拒绝路径穿越和符号链接逃逸，忽略常见构建目录，并限制扫描与读取输出。mini-Pi 不修改项目、不运行项目代码、不执行 Shell 命令。

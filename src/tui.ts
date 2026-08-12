@@ -22,14 +22,18 @@ export function parseCommand(input: string): TuiCommand {
   return text.startsWith("/") ? { type: "unknown", command: text } : { type: "prompt", prompt: text };
 }
 
-export function formatEvent(event: AgentEvent): string {
+export function formatEvent(event: AgentEvent, debug = false): string {
   if (event.type === "agent_start") return "Working...";
   if (event.type === "model_start") return `Thinking (turn ${event.turn})...`;
   if (event.type === "model_end") return event.toolCallCount ? `Using ${event.toolCallCount} tool(s)...` : "";
   if (event.type === "tool_start") return `→ ${event.toolName}`;
   if (event.type === "tool_end") return event.isError ? `✗ ${event.toolName}: ${event.message}` : `✓ ${event.toolName}`;
   if (event.type === "agent_end") return `Completed · ${event.turns} turns`;
-  return `Error: ${event.message}`;
+  if (!event.diagnostic) return `Error: ${event.message}`;
+  const label = { authentication: "认证失败", permission: "权限不足", model: "模型不可用", rate_limit: "限流", provider: "Provider 暂时不可用", network: "网络请求失败", unknown: "未知 Provider 错误" }[event.diagnostic.kind];
+  const provider = event.diagnostic.provider === "openai" ? "OpenAI" : "DeepSeek";
+  const details = [event.diagnostic.status === undefined ? "" : `HTTP ${event.diagnostic.status}`, event.diagnostic.code ? `code=${event.diagnostic.code}` : "", event.diagnostic.requestId ? `requestId=${event.diagnostic.requestId}` : ""].filter(Boolean).join(" · ");
+  return `${event.diagnostic.level === "error" ? "错误" : "警告"} [${label}]\n位置：${provider}，第 ${event.turn} 次模型请求\n原因：${event.diagnostic.reason}\n建议：${event.diagnostic.advice}${debug && details ? `\n调试：${details}` : ""}`;
 }
 
 export async function chooseProvider(): Promise<ProviderName> {
@@ -76,7 +80,7 @@ export async function startTui(agent: Agent, config: { project: string; provider
       }
       if (command.type !== "prompt") continue;
       try { const result = await session.agent.run(command.prompt); stdout.write(`${result.answer}\n`); }
-      catch (error) { stdout.write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
+      catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) stdout.write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
     }
   } finally { line.close(); }
 }
