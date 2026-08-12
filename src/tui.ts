@@ -28,13 +28,19 @@ export function sanitizeMarkdown(text: string): string {
 
 /** Keeps only renderer-generated SGR styling and removes every other terminal control. */
 export function sanitizeRenderedMarkdown(text: string): string {
-  return text
+  const removeControls = (value: string) => value
     .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
-    .replace(/\x1b\[(\d{0,3}(?:[;:]\d{0,3})*)m/g, "\uE000$1\uE001")
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
-    .replace(/\uE000(\d{0,3}(?:[;:]\d{0,3})*)\uE001/g, "\x1b[$1m");
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+  const sgr = /\x1b\[(\d{0,3}(?:[;:]\d{0,3})*)m/g;
+  let safeText = "", cursor = 0;
+  for (const style of text.matchAll(sgr)) {
+    safeText += removeControls(text.slice(cursor, style.index));
+    safeText += style[0];
+    cursor = (style.index ?? 0) + style[0].length;
+  }
+  return safeText + removeControls(text.slice(cursor));
 }
 
 const defaultMarkdownRenderer: MarkdownRenderer = (text) => renderWithMarkdansi(text, { hyperlinks: false });

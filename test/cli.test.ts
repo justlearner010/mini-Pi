@@ -51,6 +51,10 @@ test("removes controls decoded from Markdown entities and disables terminal hype
   assert(!rendered.includes("\u001b]8;") && !rendered.includes("\u001b[2J") && !rendered.includes("\u009b") && !rendered.includes("\r"));
 });
 
+test("does not turn model-controlled private-use characters into terminal styles", () => {
+  assert.equal(renderMarkdown("\uE00031\uE001", (text) => text), "\uE00031\uE001");
+});
+
 test("TUI renders only final answers and falls back to safe plain text", async () => {
   const output: string[] = [];
   const inputs = ["question", "/exit"];
