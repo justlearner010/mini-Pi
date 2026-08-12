@@ -2,12 +2,13 @@
   "name": "mini-pi",
   "private": true,
   "type": "module",
-  "bin": { "mini-pi": "./dist/cli.js" },
+  "bin": { "mini-pi": "./dist/src/cli.js" },
   "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/**/*.test.ts",
+    "verify:bin": "node scripts/verify-bin.mjs",
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
