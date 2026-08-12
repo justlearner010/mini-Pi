@@ -1,7 +1,21 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-import { completeInteractiveOptions, exitCodeFor, parseArgs, SYSTEM_PROMPT, validateOptions } from "../src/cli.js";
+import {
+  completeInteractiveOptions,
+  exitCodeFor,
+  getStartupSelection,
+  parseArgs,
+  readGlobalPreference,
+  resolveApiKey,
+  saveGlobalPreference,
+  SYSTEM_PROMPT,
+  type CredentialStore,
+  validateOptions
+} from "../src/cli.js";
 import { formatEvent, helpText, parseCommand } from "../src/tui.js";
 
 test("parseArgs recognizes help, version, provider, model, prompt, and project", () => {
@@ -101,4 +115,45 @@ test("prompt cancellation maps to the conventional Ctrl+C exit status", () => {
   assert.equal(exitCodeFor({ name: "AbortPromptError" }), 130);
   assert.equal(exitCodeFor({ code: "SIGINT" }), 130);
   assert.equal(exitCodeFor(new Error("other")), 1);
+});
+
+function fakeCredentials(values: Record<string, string | undefined> = {}): CredentialStore {
+  return {
+    getPassword: async (_service, account) => values[account] ?? null,
+    setPassword: async (_service, account, password) => { values[account] = password; },
+    deletePassword: async (_service, account) => { delete values[account]; return true; }
+  };
+}
+
+async function tempConfigPath(): Promise<string> {
+  return join(await mkdtemp(join(tmpdir(), "mini-pi-cli-")), "nested", "config.json");
+}
+
+test("environment keys override stored credentials without modifying them", async () => {
+  const credentials = fakeCredentials({ openai: "stored-key" });
+  const key = await resolveApiKey("openai", credentials, { OPENAI_API_KEY: "environment-key" });
+  assert.deepEqual(key, { apiKey: "environment-key", source: "environment" });
+  assert.equal(await credentials.getPassword("mini-Pi", "openai"), "stored-key");
+});
+
+test("a saved preference and matching credential provide direct startup selection", async () => {
+  const configPath = await tempConfigPath();
+  await saveGlobalPreference({ provider: "deepseek", model: "deepseek-chat" }, configPath);
+  const selection = await getStartupSelection(fakeCredentials({ deepseek: "stored-key" }), configPath, {});
+  assert.deepEqual(selection, {
+    provider: "deepseek", model: "deepseek-chat", apiKey: "stored-key", keySource: "credential-store"
+  });
+  assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { provider: "deepseek", model: "deepseek-chat" });
+});
+
+test("missing or malformed preferences safely produce no startup selection", async () => {
+  const missing = await tempConfigPath();
+  assert.equal(await readGlobalPreference(missing), undefined);
+  assert.equal(await getStartupSelection(fakeCredentials({ openai: "secret" }), missing, {}), undefined);
+
+  const invalid = await tempConfigPath();
+  await saveGlobalPreference({ provider: "openai", model: "temporary" }, invalid);
+  await writeFile(invalid, '{"provider":"openai","model":42}', "utf8");
+  assert.equal(await readGlobalPreference(invalid), undefined);
+  assert.equal(await getStartupSelection(fakeCredentials({ openai: "secret" }), invalid, {}), undefined);
 });
