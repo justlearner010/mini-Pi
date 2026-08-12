@@ -1,12 +1,12 @@
 # Deferred Features
 
-这份文档记录 mini-Pi 第一版明确不实现、但后续可能加入的能力，避免设计讨论中的决定丢失。
+这份文档记录 mini-Pi 当前明确不实现、但后续可能加入的能力，避免设计讨论中的决定丢失。
 
 ## LLM 输出
 
 - Token streaming：第一版不逐字输出模型内容。TUI 只展示模型调用、工具执行和最终回答等阶段事件。
 - Thinking / reasoning 模式，包括保存并回传 DeepSeek 的 `reasoning_content`。
-- OpenAI Responses API；第一版统一使用 OpenAI-compatible Chat Completions API。
+- OpenAI Responses API；当前统一使用 OpenAI-compatible Chat Completions API。
 - 自动重试、模型回退和 Token 用量统计。
 - 自定义 Provider `baseURL`。
 
@@ -15,6 +15,7 @@
 - 异步事件订阅、`EventEmitter` 或可迭代事件流。
 - `message_start`、`message_update`、`message_end` 等更细粒度消息生命周期事件。
 - Agent 事件的持久化、回放和外部观察者机制。
+- 使用 `AbortController` 优雅中止正在进行的 LLM 请求或工具调用。
 
 ## 测试与质量
 
@@ -26,9 +27,11 @@
 
 ## Provider 与认证
 
-- 账号登录和 OAuth。
+- OAuth 或账号登录。
 - 根据 Tool Calling 等能力筛选模型列表。
 - 模型列表缓存和专门的 `--list-models` 命令。
+- Linux 没有 Secret Service 时的加密文件兜底。
+- OpenAI、DeepSeek 之外的 Provider。
 
 ## 代码分析范围
 
@@ -48,9 +51,8 @@
 - 更复杂的终端组件、快捷键和布局。
 - TUI 之外的 Web UI 或其他界面。
 - 多行问题编辑、外部编辑器和输入历史持久化。
-- 项目级 Provider 或模型覆盖；第一版只保存跨项目的全局默认偏好。
+- 项目级 Provider 或模型覆盖；当前只保存跨项目的全局默认偏好。
 - 聊天会话持久化与恢复。
-- 使用 `AbortController` 优雅中止正在进行的 LLM 请求或工具调用。
 - `--provider`、`--model` 等参数的短名称。
 - 日志等级和 Debug 模式。
 
