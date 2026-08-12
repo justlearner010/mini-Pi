@@ -16,6 +16,7 @@ export interface AgentConfig {
   rootDir: string;
   maxTurns?: number;
   onEvent?: (event: AgentEvent) => void;
+  messages?: Message[];
 }
 export interface AgentResult { answer: string; messages: Message[]; turns: number; }
 
@@ -42,10 +43,11 @@ export class Agent {
     this.rootDir = config.rootDir;
     this.maxTurns = config.maxTurns ?? 8;
     this.onEvent = config.onEvent;
-    this.messages = [{ role: "system", content: this.systemPrompt }];
+    this.messages = structuredClone(config.messages ?? [{ role: "system", content: this.systemPrompt }]);
   }
 
   reset(): void { this.messages = [{ role: "system", content: this.systemPrompt }]; }
+  history(): Message[] { return structuredClone(this.messages); }
 
   async run(prompt: string): Promise<AgentResult> {
     const start = this.messages.length;

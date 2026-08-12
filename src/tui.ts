@@ -8,7 +8,7 @@ import type { ProviderName } from "./llm.js";
 
 export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
 export type TuiSession = { agent: Agent; provider: ProviderName; model: string };
-export type TuiActions = { login: () => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined> };
+export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined> };
 
 export function parseCommand(input: string): TuiCommand {
   const text = input.trim();
@@ -65,7 +65,7 @@ export async function startTui(agent: Agent, config: { project: string; provider
       if (command.type === "empty") { stdout.write("Enter a question or /help.\n"); continue; }
       if (command.type === "unknown") { stdout.write(`Unknown command: ${command.command}\n`); continue; }
       if (command.type === "login" || command.type === "model") {
-        try { session = command.type === "login" ? await actions!.login() : await actions!.model(session); stdout.write(`Using ${session.provider} / ${session.model}.\n`); }
+        try { session = command.type === "login" ? await actions!.login(session) : await actions!.model(session); stdout.write(`Using ${session.provider} / ${session.model}.\n`); }
         catch (error) { stdout.write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
         continue;
       }

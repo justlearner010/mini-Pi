@@ -78,7 +78,7 @@ export async function saveGlobalPreference(preference: GlobalPreference, configP
     await unlink(temporary).catch(() => undefined);
   }
 }
-export async function clearGlobalPreference(configPath = defaultConfigPath()): Promise<void> { await unlink(configPath).catch(() => undefined); }
+export async function clearGlobalPreference(configPath = defaultConfigPath()): Promise<void> { try { await unlink(configPath); } catch (error) { if ((error as { code?: string }).code !== "ENOENT") throw error; } }
 
 export async function resolveApiKey(provider: ProviderName, credentials: CredentialStore, env: NodeJS.ProcessEnv = process.env): Promise<{ apiKey: string; source: KeySource } | undefined> {
   const environmentKey = env[environmentName(provider)];
@@ -197,9 +197,9 @@ function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model"
   return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent });
 }
 
-export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env): Promise<ValidatedOptions> {
+export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env, credentials?: CredentialStore): Promise<ValidatedOptions> {
   const provider = valid.provider ?? await deps.chooseProvider();
-  const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, env, valid.rootDir);
+  const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, env, valid.rootDir, credentials);
   if (refreshed.error || refreshed.model) return refreshed;
   try {
     const models = await deps.listModels(provider, refreshed.apiKey!);
@@ -222,15 +222,15 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
     if (!valid.provider && !valid.model && !valid.prompt) {
       const saved = await getStartupSelection(systemCredentials, defaultConfigPath(), env);
       valid = saved ? { ...valid, ...saved } : { ...valid, ...(await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference })) };
-    } else if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env);
+    } else if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env, systemCredentials);
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ ...valid as Required<Pick<ValidatedOptions, "rootDir">>, ...selection, apiKey }, (event) => { const text = formatEvent(event); if (text) console.log(text); }) });
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: new Agent({ llm: createLLM({ provider: selection.provider, model: selection.model, apiKey }), tools, rootDir: valid.rootDir!, systemPrompt: SYSTEM_PROMPT, messages: history, onEvent: (event) => { const text = formatEvent(event); if (text) console.log(text); } }) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
   if (valid.prompt) { try { console.log((await session.agent.run(valid.prompt)).answer); return 0; } catch { return 1; } }
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {
-    login: async () => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey); },
-    model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey); },
+    login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
+    model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.agent.history()); },
     logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference)
   });
 }

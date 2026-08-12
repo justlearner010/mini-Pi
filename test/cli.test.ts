@@ -109,6 +109,14 @@ test("interactive completion uses the supplied environment and preserves cancell
   );
 });
 
+test("model-only CLI resolves the selected provider's saved credential", async () => {
+  const initial = await validateOptions(parseArgs([".", "--model", "chosen"]), {}, process.cwd());
+  const complete = await completeInteractiveOptions(initial, { chooseProvider: async () => "deepseek", chooseModel: async () => "never", listModels: async () => [] }, {}, fakeCredentials({ deepseek: "stored-key" }));
+  assert.equal(complete.provider, "deepseek");
+  assert.equal(complete.model, "chosen");
+  assert.equal(complete.apiKey, "stored-key");
+});
+
 test("help identifies the active project provider and model, and system prompt is exact", () => {
   assert.match(helpText("/project", "openai", "gpt"), /Project: \/project/);
   assert.match(helpText("/project", "openai", "gpt"), /Provider: openai/);
@@ -240,4 +248,10 @@ test("logout chooses a stored provider and clears the matching default only", as
   assert.equal(provider, "deepseek");
   assert.equal(values.deepseek, undefined);
   assert.deepEqual(cleared, ["default"]);
+});
+
+test("logout reports a failed default cleanup instead of claiming completion", async () => {
+  const values: Record<string, string | undefined> = { deepseek: "key" };
+  await assert.rejects(logoutFromCredentialStore(fakeCredentials(values), { provider: "deepseek", model: "chat" }, async () => "deepseek", async () => { throw new Error("preference cleanup failed"); }), /preference cleanup failed/);
+  assert.equal(values.deepseek, undefined);
 });

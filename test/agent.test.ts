@@ -104,6 +104,16 @@ test("reset restores only the system prompt and provider failures rollback a run
   ]);
 });
 
+test("an agent can carry a completed conversation into a replacement model", async () => {
+  const one = fakeLLM([response("one")]);
+  const two = fakeLLM([response("two")]);
+  const first = new Agent({ llm: one.llm, tools: [], rootDir: ".", systemPrompt: "system" });
+  await first.run("first");
+  const second = new Agent({ llm: two.llm, tools: [], rootDir: ".", systemPrompt: "system", messages: first.history() });
+  const result = await second.run("second");
+  assert.deepEqual(result.messages.map((message) => message.content), ["system", "first", "one", "second", "two"]);
+});
+
 test("tool events summarize errors and never leak large tool content", async () => {
   const large = "sensitive-content-".repeat(1000);
   const fake = fakeLLM([response(null, [{ id: "ok", name: "large", arguments: "{}" }, { id: "bad", name: "fail", arguments: "{}" }]), response("done")]);
