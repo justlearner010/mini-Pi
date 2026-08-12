@@ -21,7 +21,29 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, startTui, type TuiRuntime } from "../src/tui.js";
+
+test("interactive command releases its prompt and returns to the next prompt", async () => {
+  const inputs = ["/login", "/model", "/logout", "/exit"];
+  const closed: number[] = [];
+  const output: string[] = [];
+  const runtime: TuiRuntime = {
+    createLine: () => ({
+      question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }),
+      close: () => { closed.push(1); }
+    }),
+    write: (text) => { output.push(text); }
+  };
+  const agent = { reset() {} } as never;
+  const result = await startTui(agent, { project: "/project", provider: "deepseek", model: "old" }, {
+    login: async (session) => session,
+    model: async (session) => ({ ...session, model: "new" }),
+    logout: async () => undefined
+  }, runtime);
+  assert.equal(result, 0);
+  assert.equal(closed.length, 4);
+  assert(output.some((text) => text.includes("Using deepseek / new.")));
+});
 
 test("parseArgs recognizes help, version, provider, model, prompt, and project", () => {
   assert.deepEqual(parseArgs(["demo", "--provider", "openai", "--model", "gpt-4.1", "--prompt", "hi"]), {
