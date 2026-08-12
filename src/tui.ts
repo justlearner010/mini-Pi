@@ -16,15 +16,31 @@ export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) =>
 
 /** Removes terminal control input from untrusted model text while retaining layout. */
 export function sanitizeMarkdown(text: string): string {
-  return text
+  return text.replace(/&#(?:x([0-9a-f]+)|([0-9]+));/gi, (_match, hex, decimal) => {
+    const codePoint = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
+    return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "";
+  })
     .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 }
 
-export function renderMarkdown(text: string, renderer: MarkdownRenderer = renderWithMarkdansi): string {
-  return renderer(sanitizeMarkdown(text));
+/** Keeps only renderer-generated SGR styling and removes every other terminal control. */
+export function sanitizeRenderedMarkdown(text: string): string {
+  return text
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
+    .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
+    .replace(/\x1b\[(\d{0,3}(?:[;:]\d{0,3})*)m/g, "\uE000$1\uE001")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
+    .replace(/\uE000(\d{0,3}(?:[;:]\d{0,3})*)\uE001/g, "\x1b[$1m");
+}
+
+const defaultMarkdownRenderer: MarkdownRenderer = (text) => renderWithMarkdansi(text, { hyperlinks: false });
+
+export function renderMarkdown(text: string, renderer: MarkdownRenderer = defaultMarkdownRenderer): string {
+  return sanitizeRenderedMarkdown(renderer(sanitizeMarkdown(text)));
 }
 
 export function parseCommand(input: string): TuiCommand {

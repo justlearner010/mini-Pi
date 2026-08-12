@@ -39,6 +39,18 @@ test("removes model terminal controls before rendering", () => {
   assert(!rendered.includes("\u001b") && !rendered.includes("\u009b") && !rendered.includes("\u0000"));
 });
 
+test("removes controls decoded from Markdown entities and disables terminal hyperlinks", () => {
+  const markdown = "[safe](https://example.com/&#x0d;bad)&#x9b;31m";
+  let received = "";
+  const rendered = renderMarkdown(markdown, (text) => {
+    received = text;
+    return "\u001b[32msafe\u001b[0m\u001b]8;;https://bad\u0007safe\u001b]8;;\u0007\u001b[2J\u009b31m";
+  });
+  assert.equal(received, "[safe](https://example.com/bad)");
+  assert.match(rendered, /\u001b\[32msafe\u001b\[0m/);
+  assert(!rendered.includes("\u001b]8;") && !rendered.includes("\u001b[2J") && !rendered.includes("\u009b") && !rendered.includes("\r"));
+});
+
 test("TUI renders only final answers and falls back to safe plain text", async () => {
   const output: string[] = [];
   const inputs = ["question", "/exit"];
