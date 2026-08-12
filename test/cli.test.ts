@@ -52,6 +52,7 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "model_start", turn: 2 }), "Thinking (turn 2)...");
   assert.equal(formatEvent({ type: "tool_end", turn: 1, toolCallId: "x", toolName: "read_file", isError: false, message: "completed" }), "✓ read_file");
   assert.equal(formatEvent({ type: "error", stage: "model", message: "Model request failed" }), "Error: Model request failed");
+  assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
 });
 
 test("interactive completion uses provider models unless a model was supplied", async () => {
@@ -75,6 +76,18 @@ test("interactive completion reports model listing failures and empty lists", as
   assert.match(empty.error ?? "", /pass --model/);
 });
 
+test("interactive completion uses the supplied environment and preserves cancellation", async () => {
+  const noProvider = await validateOptions(parseArgs(["."]), {}, process.cwd());
+  const complete = await completeInteractiveOptions(noProvider, {
+    chooseProvider: async () => "openai", chooseModel: async (models) => models[0], listModels: async () => ["model"]
+  }, { OPENAI_API_KEY: "injected" });
+  assert.equal(complete.apiKey, "injected");
+  await assert.rejects(
+    completeInteractiveOptions(noProvider, { chooseProvider: async () => { throw { name: "ExitPromptError" }; }, chooseModel: async () => "", listModels: async () => [] }, {}),
+    { name: "ExitPromptError" }
+  );
+});
+
 test("help identifies the active project provider and model, and system prompt is exact", () => {
   assert.match(helpText("/project", "openai", "gpt"), /Project: \/project/);
   assert.match(helpText("/project", "openai", "gpt"), /Provider: openai/);
@@ -85,5 +98,7 @@ test("help identifies the active project provider and model, and system prompt i
 
 test("prompt cancellation maps to the conventional Ctrl+C exit status", () => {
   assert.equal(exitCodeFor({ name: "ExitPromptError" }), 130);
+  assert.equal(exitCodeFor({ name: "AbortPromptError" }), 130);
+  assert.equal(exitCodeFor({ code: "SIGINT" }), 130);
   assert.equal(exitCodeFor(new Error("other")), 1);
 });

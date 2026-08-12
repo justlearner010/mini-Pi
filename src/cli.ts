@@ -13,7 +13,8 @@ export type ValidatedOptions = CliOptions & { rootDir?: string; apiKey?: string;
 export type InteractiveDeps = { chooseProvider: () => Promise<ProviderName>; chooseModel: (models: string[]) => Promise<string>; listModels: (provider: ProviderName, key: string) => Promise<string[]> };
 
 export function exitCodeFor(error: unknown): number {
-  return (error as { name?: string })?.name === "ExitPromptError" ? 130 : 1;
+  const failure = error as { name?: string; code?: string };
+  return failure?.name === "ExitPromptError" || failure?.name === "AbortPromptError" || failure?.code === "SIGINT" ? 130 : 1;
 }
 
 export function parseArgs(args: string[]): CliOptions {
@@ -82,15 +83,18 @@ function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model"
   return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent });
 }
 
-export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }): Promise<ValidatedOptions> {
+export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env): Promise<ValidatedOptions> {
   const provider = valid.provider ?? await deps.chooseProvider();
-  const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, process.env, valid.rootDir);
+  const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, env, valid.rootDir);
   if (refreshed.error || refreshed.model) return refreshed;
   try {
     const models = await deps.listModels(provider, refreshed.apiKey!);
     if (!models.length) throw new Error("empty");
     return { ...refreshed, model: await deps.chooseModel(models) };
-  } catch { return { ...refreshed, error: "Unable to list models; pass --model to specify one manually" }; }
+  } catch (error) {
+    if (exitCodeFor(error) === 130) throw error;
+    return { ...refreshed, error: "Unable to list models; pass --model to specify one manually" };
+  }
 }
 
 export async function run(args = process.argv.slice(2), env = process.env, cwd = process.cwd()): Promise<number> {
@@ -101,7 +105,7 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   let valid = await validateOptions(options, env, cwd);
   if (valid.error) { console.error(valid.error); return 1; }
   try {
-    if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels });
+    if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env);
   } catch (error) { return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
   const agent = makeAgent(valid as Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, (event) => { const text = formatEvent(event); if (text) console.log(text); });

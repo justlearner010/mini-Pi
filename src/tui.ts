@@ -22,7 +22,7 @@ export function formatEvent(event: AgentEvent): string {
   if (event.type === "model_end") return event.toolCallCount ? `Using ${event.toolCallCount} tool(s)...` : "";
   if (event.type === "tool_start") return `→ ${event.toolName}`;
   if (event.type === "tool_end") return event.isError ? `✗ ${event.toolName}: ${event.message}` : `✓ ${event.toolName}`;
-  if (event.type === "agent_end") return "";
+  if (event.type === "agent_end") return `Completed · ${event.turns} turns`;
   return `Error: ${event.message}`;
 }
 
@@ -44,7 +44,11 @@ export async function startTui(agent: Agent, config: { project: string; provider
   try {
     while (true) {
       let input: string;
-      try { input = await line.question("> "); } catch { return 0; }
+      try { input = await line.question("> "); }
+      catch (error) {
+        const failure = error as { name?: string; code?: string };
+        return failure?.name === "AbortPromptError" || failure?.code === "SIGINT" ? 130 : 0;
+      }
       const command = parseCommand(input);
       if (command.type === "exit") return 0;
       if (command.type === "help") { stdout.write(`${helpText(config.project, config.provider, config.model)}\n`); continue; }
