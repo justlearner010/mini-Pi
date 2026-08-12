@@ -1,4 +1,4 @@
-import type { LLMClient, Message, ToolCall } from "./llm.js";
+import { ProviderDiagnostic, type LLMClient, type Message, type ProviderDiagnosticData, type ToolCall } from "./llm.js";
 import type { Tool } from "./tool.js";
 
 export type AgentEvent =
@@ -8,7 +8,7 @@ export type AgentEvent =
   | { type: "tool_start"; turn: number; toolCallId: string; toolName: string }
   | { type: "tool_end"; turn: number; toolCallId: string; toolName: string; isError: boolean; message: string }
   | { type: "agent_end"; answer: string; turns: number }
-  | { type: "error"; stage: "model" | "agent"; message: string };
+  | { type: "error"; stage: "model" | "agent"; message: string; turn?: number; diagnostic?: ProviderDiagnosticData };
 export interface AgentConfig {
   llm: LLMClient;
   tools: Tool[];
@@ -16,6 +16,7 @@ export interface AgentConfig {
   rootDir: string;
   maxTurns?: number;
   onEvent?: (event: AgentEvent) => void;
+  messages?: Message[];
 }
 export interface AgentResult { answer: string; messages: Message[]; turns: number; }
 
@@ -42,10 +43,11 @@ export class Agent {
     this.rootDir = config.rootDir;
     this.maxTurns = config.maxTurns ?? 8;
     this.onEvent = config.onEvent;
-    this.messages = [{ role: "system", content: this.systemPrompt }];
+    this.messages = structuredClone(config.messages ?? [{ role: "system", content: this.systemPrompt }]);
   }
 
   reset(): void { this.messages = [{ role: "system", content: this.systemPrompt }]; }
+  history(): Message[] { return structuredClone(this.messages); }
 
   async run(prompt: string): Promise<AgentResult> {
     const start = this.messages.length;
@@ -59,7 +61,7 @@ export class Agent {
         this.emit({ type: "model_start", turn });
         let response;
         try { response = await this.llm.generate(this.messages, this.tools); }
-        catch { throw { stage: "model", message: "Model request failed" }; }
+        catch (error) { throw error instanceof ProviderDiagnostic ? { stage: "model", turn, message: error.message, diagnostic: error } : { stage: "model", message: "Model request failed" }; }
         turns += 1;
         const message = response.message;
         this.emit({ type: "model_end", turn, toolCallCount: message.toolCalls.length });
@@ -74,11 +76,11 @@ export class Agent {
       }
     } catch (error) {
       this.messages.splice(start);
-      const failure = error as { stage?: "model" | "agent"; message?: string };
+      const failure = error as { stage?: "model" | "agent"; turn?: number; message?: string; diagnostic?: ProviderDiagnosticData };
       const message = failure.message ?? (error instanceof Error ? error.message : "Agent failed");
-      this.emit({ type: "error", stage: failure.stage ?? "agent", message });
+      this.emit({ type: "error", stage: failure.stage ?? "agent", message, ...(failure.diagnostic ? { turn: failure.turn, diagnostic: failure.diagnostic } : {}) });
       this.emit({ type: "agent_end", answer: "", turns });
-      throw new Error(message);
+      throw failure.diagnostic instanceof ProviderDiagnostic ? failure.diagnostic : new Error(message);
     }
   }
 

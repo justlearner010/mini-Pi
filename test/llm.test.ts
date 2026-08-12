@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createLLM, listModels, type ProviderClient } from "../src/llm.js";
+import { createLLM, listModels, ProviderDiagnostic, type ProviderClient } from "../src/llm.js";
 
 function fakeClient(reply: unknown, models: string[] = ["z", "a", "z"]): ProviderClient & { requests: unknown[] } {
   const requests: unknown[] = [];
@@ -38,10 +38,10 @@ test("generate converts every message role, tools, null content, and multiple to
 
 test("generate returns a safe error for provider failures and malformed empty responses", async () => {
   const failing = fakeClient({ choices: [] });
-  await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, failing).generate([], []), /Provider returned no choices/);
+  await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, failing).generate([], []), (error: unknown) => error instanceof ProviderDiagnostic && error.kind === "unknown");
   const rejected = fakeClient({});
   rejected.chat.completions.create = async () => { throw new Error("key secret was rejected"); };
-  await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, rejected).generate([], []), (error: Error) => !error.message.includes("secret") && /Provider request failed/.test(error.message));
+  await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, rejected).generate([], []), (error: Error) => !error.message.includes("secret") && /Provider 请求失败/.test(error.message));
 });
 
 test("listModels sorts and deduplicates ids and reports safe provider errors", async () => {
@@ -55,4 +55,35 @@ test("DeepSeek requests disable thinking explicitly", async () => {
   const client = fakeClient({ choices: [{ message: { content: "ok", tool_calls: [] } }] });
   await createLLM({ provider: "deepseek", model: "deepseek-chat", apiKey: "secret" }, client).generate([{ role: "user", content: "hi" }], []);
   assert.deepEqual(client.requests, [{ model: "deepseek-chat", messages: [{ role: "user", content: "hi" }], tools: [], extra_body: { thinking: { type: "disabled" } } }]);
+});
+
+test("classifies provider failures without retaining unsafe exception text", async () => {
+  const leaked = "sk-secret Authorization: Bearer token request-body=file content tool-body response-body stack trace";
+  const rejected = fakeClient({});
+  rejected.chat.completions.create = async () => { throw Object.assign(new Error(leaked), { status: 401, code: "invalid_api_key", request_id: "req_1", requestId: "sk-secret" }); };
+  await assert.rejects(() => createLLM({ provider: "deepseek", model: "x", apiKey: "secret" }, rejected).generate([], []), (error: unknown) => {
+    assert(error instanceof ProviderDiagnostic);
+    assert.deepEqual({ level: error.level, kind: error.kind, provider: error.provider, status: error.status, code: error.code, requestId: error.requestId }, { level: "error", kind: "authentication", provider: "deepseek", status: 401, code: "invalid_api_key", requestId: undefined });
+    assert(!JSON.stringify(error).includes(leaked));
+    return true;
+  });
+});
+
+test("classifies every safe provider failure category", async () => {
+  const cases = [
+    [{ status: 403 }, "permission", "error"], [{ status: 404 }, "model", "warning"], [{ status: 429 }, "rate_limit", "warning"],
+    [{ status: 503 }, "provider", "warning"], [{ code: "ETIMEDOUT" }, "network", "warning"], [{ code: "OTHER" }, "unknown", "warning"]
+  ] as const;
+  for (const [properties, kind, level] of cases) {
+    const rejected = fakeClient({});
+    rejected.chat.completions.create = async () => { throw Object.assign(new Error("unsafe secret response text"), properties); };
+    await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, rejected).generate([], []), (error: unknown) => error instanceof ProviderDiagnostic && error.kind === kind && error.level === level);
+  }
+});
+
+test("drops untrusted provider debug strings and diagnoses malformed responses", async () => {
+  const rejected = fakeClient({});
+  rejected.chat.completions.create = async () => { throw Object.assign(new Error("failure"), { status: 401, code: "api_key_SECRET", request_id: "token-super-secret" }); };
+  await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, rejected).generate([], []), (error: unknown) => error instanceof ProviderDiagnostic && error.code === undefined && error.requestId === undefined);
+  await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, fakeClient({ choices: [] })).generate([], []), (error: unknown) => error instanceof ProviderDiagnostic && error.kind === "unknown" && /无法分类/.test(error.reason));
 });
