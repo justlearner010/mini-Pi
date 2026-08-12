@@ -9,6 +9,8 @@ import type { ProviderName } from "./llm.js";
 export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
 export type TuiSession = { agent: Agent; provider: ProviderName; model: string };
 export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined> };
+export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
+export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void };
 
 export function parseCommand(input: string): TuiCommand {
   const text = input.trim();
@@ -51,37 +53,37 @@ export function helpText(project: string, provider: ProviderName, model: string)
   return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /help, /reset, /exit`;
 }
 
-export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions): Promise<number> {
-  const line = createInterface({ input: stdin, output: stdout });
+export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions, runtime: TuiRuntime = {}): Promise<number> {
+  const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
+  const write = runtime.write ?? ((text: string) => { stdout.write(text); });
   let session: TuiSession = { agent, provider: config.provider, model: config.model };
-  stdout.write("mini-Pi ready. /help for commands.\n");
-  try {
-    while (true) {
-      let input: string;
-      try { input = await line.question("> "); }
-      catch (error) {
-        const failure = error as { name?: string; code?: string };
-        return failure?.name === "AbortPromptError" || failure?.code === "SIGINT" ? 130 : 0;
-      }
+  write("mini-Pi ready. /help for commands.\n");
+  while (true) {
+    const line = createLine();
+    let input: string;
+    try { input = await line.question("> "); }
+    catch (error) {
+      const failure = error as { name?: string; code?: string };
+      return failure?.name === "AbortPromptError" || failure?.code === "SIGINT" ? 130 : 0;
+    } finally { line.close(); }
       const command = parseCommand(input);
       if (command.type === "exit") return 0;
-      if (command.type === "help") { stdout.write(`${helpText(config.project, session.provider, session.model)}\n`); continue; }
-      if (command.type === "reset") { session.agent.reset(); stdout.write("Conversation reset.\n"); continue; }
-      if (command.type === "empty") { stdout.write("Enter a question or /help.\n"); continue; }
-      if (command.type === "unknown") { stdout.write(`Unknown command: ${command.command}\n`); continue; }
+      if (command.type === "help") { write(`${helpText(config.project, session.provider, session.model)}\n`); continue; }
+      if (command.type === "reset") { session.agent.reset(); write("Conversation reset.\n"); continue; }
+      if (command.type === "empty") { write("Enter a question or /help.\n"); continue; }
+      if (command.type === "unknown") { write(`Unknown command: ${command.command}\n`); continue; }
       if (command.type === "login" || command.type === "model") {
-        try { session = command.type === "login" ? await actions!.login(session) : await actions!.model(session); stdout.write(`Using ${session.provider} / ${session.model}.\n`); }
-        catch (error) { stdout.write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
+        try { session = command.type === "login" ? await actions!.login(session) : await actions!.model(session); write(`Using ${session.provider} / ${session.model}.\n`); }
+        catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
         continue;
       }
       if (command.type === "logout") {
-        try { const provider = await actions!.logout(); stdout.write(provider ? `${provider} credentials removed. Current session remains active.\n` : "No stored credentials to remove.\n"); }
-        catch (error) { stdout.write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
+        try { const provider = await actions!.logout(); write(provider ? `${provider} credentials removed. Current session remains active.\n` : "No stored credentials to remove.\n"); }
+        catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
         continue;
       }
       if (command.type !== "prompt") continue;
-      try { const result = await session.agent.run(command.prompt); stdout.write(`${result.answer}\n`); }
-      catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) stdout.write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
-    }
-  } finally { line.close(); }
+      try { const result = await session.agent.run(command.prompt); write(`${result.answer}\n`); }
+      catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
+  }
 }
