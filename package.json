@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@github/keytar": "7.10.6",
+    "@inquirer/password": "5.1.1",
     "@inquirer/select": "5.2.1",
     "openai": "7.4.0",
     "typescript": "5.9.3"

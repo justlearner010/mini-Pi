@@ -7,11 +7,14 @@ import test from "node:test";
 import {
   completeInteractiveOptions,
   createSystemCredentialStore,
+  loginWithCredentialStore,
+  logoutFromCredentialStore,
   exitCodeFor,
   getStartupSelection,
   parseArgs,
   readGlobalPreference,
   resolveApiKey,
+  selectAndSaveModel,
   saveGlobalPreference,
   SYSTEM_PROMPT,
   type CredentialStore,
@@ -44,7 +47,7 @@ test("validateOptions rejects a missing project or provider key", async () => {
   const missing = await validateOptions(parseArgs(["not-a-real-project"]), {}, process.cwd());
   assert.match(missing.error ?? "", /Project directory/);
   const key = await validateOptions(parseArgs([".", "--provider", "deepseek", "--model", "x"]), {}, process.cwd());
-  assert.match(key.error ?? "", /DEEPSEEK_API_KEY/);
+  assert.match(key.error ?? "", /No saved API key/);
   const file = await validateOptions(parseArgs(["package.json"]), {}, process.cwd());
   assert.match(file.error ?? "", /Project directory/);
 });
@@ -58,6 +61,9 @@ test("TUI commands and blank input have stable meanings", () => {
   assert.deepEqual(parseCommand("/help"), { type: "help" });
   assert.deepEqual(parseCommand("/reset"), { type: "reset" });
   assert.deepEqual(parseCommand("/exit"), { type: "exit" });
+  assert.deepEqual(parseCommand("/login"), { type: "login" });
+  assert.deepEqual(parseCommand("/model"), { type: "model" });
+  assert.deepEqual(parseCommand("/logout"), { type: "logout" });
   assert.deepEqual(parseCommand(""), { type: "empty" });
   assert.deepEqual(parseCommand("/wat"), { type: "unknown", command: "/wat" });
   assert.deepEqual(parseCommand("inspect src"), { type: "prompt", prompt: "inspect src" });
@@ -107,6 +113,7 @@ test("help identifies the active project provider and model, and system prompt i
   assert.match(helpText("/project", "openai", "gpt"), /Project: \/project/);
   assert.match(helpText("/project", "openai", "gpt"), /Provider: openai/);
   assert.match(helpText("/project", "openai", "gpt"), /Model: gpt/);
+  assert.match(helpText("/project", "openai", "gpt"), /\/login, \/model, \/logout/);
   assert.match(SYSTEM_PROMPT, /Use tools to gather evidence before making claims/);
   assert.match(SYSTEM_PROMPT, /Answer in the user's language/);
 });
@@ -181,4 +188,56 @@ test("a failed preference save removes its temporary file", async () => {
   await mkdir(configPath);
   await assert.rejects(saveGlobalPreference({ provider: "openai", model: "gpt" }, configPath));
   assert.deepEqual(await readdir(directory), ["config.json"]);
+});
+
+test("login validates and selects before committing a credential and preference", async () => {
+  const values: Record<string, string | undefined> = { openai: "old-key" };
+  const saved: Array<{ provider: string; model: string }> = [];
+  const result = await loginWithCredentialStore({
+    credentials: fakeCredentials(values), chooseProvider: async () => "deepseek", askApiKey: async () => "new-key",
+    listModels: async (provider, key) => { assert.equal(provider, "deepseek"); assert.equal(key, "new-key"); return ["chat"]; },
+    chooseModel: async (models) => models[0], savePreference: async (preference) => { saved.push(preference); }
+  });
+  assert.deepEqual(result, { provider: "deepseek", model: "chat", apiKey: "new-key", keySource: "credential-store" });
+  assert.equal(values.deepseek, "new-key");
+  assert.deepEqual(saved, [{ provider: "deepseek", model: "chat" }]);
+});
+
+test("login and model selection leave existing state unchanged when interaction or saving fails", async () => {
+  const values: Record<string, string | undefined> = { openai: "old-key" };
+  const credentials = fakeCredentials(values);
+  await assert.rejects(loginWithCredentialStore({
+    credentials, chooseProvider: async () => "deepseek", askApiKey: async () => "bad-key", listModels: async () => { throw new Error("bad key"); },
+    chooseModel: async () => "never", savePreference: async () => undefined
+  }), /bad key/);
+  assert.deepEqual(values, { openai: "old-key" });
+  await assert.rejects(loginWithCredentialStore({
+    credentials, chooseProvider: async () => "deepseek", askApiKey: async () => "new-key", listModels: async () => ["chat"],
+    chooseModel: async () => "chat", savePreference: async () => { throw new Error("disk failed"); }
+  }), /disk failed/);
+  assert.equal((values as Record<string, string | undefined>)["deepseek"], undefined);
+  const preference = { provider: "openai" as const, model: "old-model" };
+  await assert.rejects(selectAndSaveModel(preference, "old-key", {
+    listModels: async () => ["new-model"],
+    chooseModel: async () => "new-model", savePreference: async () => { throw new Error("disk failed"); }
+  }), /disk failed/);
+  assert.deepEqual(preference, { provider: "openai", model: "old-model" });
+});
+
+test("login does not save a preference when secure credential storage is unavailable", async () => {
+  let saved = false;
+  const unavailable: CredentialStore = { getPassword: async () => { throw new Error("unavailable"); }, setPassword: async () => { throw new Error("unavailable"); }, deletePassword: async () => false };
+  await assert.rejects(loginWithCredentialStore({ credentials: unavailable, chooseProvider: async () => "openai", askApiKey: async () => "key", listModels: async () => ["model"], chooseModel: async () => "model", savePreference: async () => { saved = true; } }), /unavailable/);
+  assert.equal(saved, false);
+});
+
+test("logout chooses a stored provider and clears the matching default only", async () => {
+  const values: Record<string, string | undefined> = { openai: "one", deepseek: "two" };
+  const cleared: string[] = [];
+  const provider = await logoutFromCredentialStore(fakeCredentials(values), { provider: "deepseek", model: "chat" }, async (items) => {
+    assert.deepEqual(items, ["openai", "deepseek"]); return "deepseek";
+  }, async () => { cleared.push("default"); });
+  assert.equal(provider, "deepseek");
+  assert.equal(values.deepseek, undefined);
+  assert.deepEqual(cleared, ["default"]);
 });
