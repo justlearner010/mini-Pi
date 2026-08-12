@@ -45,6 +45,38 @@ test("interactive command releases its prompt and returns to the next prompt", a
   assert(output.some((text) => text.includes("Using deepseek / new.")));
 });
 
+test("a failed interactive command returns to the next prompt", async () => {
+  const inputs = ["/model", "/exit"];
+  const closed: number[] = [];
+  const output: string[] = [];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => { closed.push(1); } }),
+    write: (text) => { output.push(text); }
+  };
+  const result = await startTui({ reset() {} } as never, { project: "/project", provider: "deepseek", model: "old" }, {
+    login: async (session) => session,
+    model: async () => { throw new Error("cancelled"); },
+    logout: async () => undefined
+  }, runtime);
+  assert.equal(result, 0);
+  assert.equal(closed.length, 2);
+  assert(output.some((text) => text.includes("Error: cancelled")));
+});
+
+test("prompt EOF exits normally after closing its readline", async () => {
+  let closed = false;
+  const runtime: TuiRuntime = { createLine: () => ({ question: async () => Promise.reject({ code: "EOF" }), close: () => { closed = true; } }), write: () => undefined };
+  assert.equal(await startTui({ reset() {} } as never, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime), 0);
+  assert.equal(closed, true);
+});
+
+test("prompt SIGINT exits with 130 after closing its readline", async () => {
+  let closed = false;
+  const runtime: TuiRuntime = { createLine: () => ({ question: async () => Promise.reject({ code: "SIGINT" }), close: () => { closed = true; } }), write: () => undefined };
+  assert.equal(await startTui({ reset() {} } as never, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime), 130);
+  assert.equal(closed, true);
+});
+
 test("parseArgs recognizes help, version, provider, model, prompt, and project", () => {
   assert.deepEqual(parseArgs(["demo", "--provider", "openai", "--model", "gpt-4.1", "--prompt", "hi"]), {
     project: "demo", provider: "openai", model: "gpt-4.1", prompt: "hi", help: false, version: false
