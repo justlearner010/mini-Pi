@@ -84,6 +84,22 @@ test("terminal approval strips terminal controls and bidi characters from untrus
   assert.match(rendered, /"path": "safetext.txt"/);
 });
 
+test("terminal approval strips every default-ignorable Unicode character from untrusted details", async () => {
+  const output: string[] = [];
+  const invisible = "\u061c\u180e\u034f\ufe0f\udb40\udd00";
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => "no", close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await requestTerminalApproval({
+    toolName: `tool${invisible}name`, permission: "SENSITIVE", reason: `reason${invisible}text`, risk: `risk${invisible}text`, arguments: { path: `file${invisible}.txt` }
+  }, runtime);
+  const rendered = output.join("");
+  assert(!/\p{Default_Ignorable_Code_Point}/u.test(rendered));
+  assert.match(rendered, /Tool: toolname/);
+  assert.match(rendered, /"path": "file.txt"/);
+});
+
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
   for (const text of ["Heading", "bold", "italic", "code", "item", "const value = 1;", "link", "row", "cell"]) assert.match(rendered, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

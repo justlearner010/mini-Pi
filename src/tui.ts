@@ -23,7 +23,7 @@ function sanitizeApprovalDisplay(text: string, maximumLength: number, preserveNe
     .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "");
-  const controls = preserveNewlines ? /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g : /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
+  const controls = preserveNewlines ? /[\x00-\x09\x0b-\x1f\x7f-\x9f]|\p{Default_Ignorable_Code_Point}/gu : /[\x00-\x1f\x7f-\x9f]|\p{Default_Ignorable_Code_Point}/gu;
   const safe = withoutTerminalSequences.replace(controls, "");
   return safe.length > maximumLength ? `${safe.slice(0, maximumLength)}… [truncated]` : safe;
 }
