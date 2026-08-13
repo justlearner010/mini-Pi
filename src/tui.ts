@@ -4,7 +4,7 @@ import select from "@inquirer/select";
 import password from "@inquirer/password";
 import { render as renderWithMarkdansi } from "markdansi";
 
-import type { Agent, AgentEvent } from "./agent.js";
+import type { Agent, AgentEvent, ApprovalDecision, ApprovalRequest } from "./agent.js";
 import type { ProviderName } from "./llm.js";
 
 export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
@@ -13,6 +13,27 @@ export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; 
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
+
+function approvalArguments(argumentsValue: unknown): string {
+  try { return JSON.stringify(argumentsValue, null, 2) ?? "[unavailable]"; }
+  catch { return "[unavailable]"; }
+}
+
+/** Prompts locally for an Agent tool permission decision; every unexpected input fails closed. */
+export async function requestTerminalApproval(request: ApprovalRequest, runtime: TuiRuntime = {}): Promise<ApprovalDecision> {
+  const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
+  const write = runtime.write ?? ((text: string) => { stdout.write(text); });
+  const destructive = request.permission === "DESTRUCTIVE";
+  const required = destructive ? "yes" : "y";
+  write(`\nTool: ${request.toolName}\nReason: ${request.reason}\nRisk: ${request.risk}\nArguments:\n${approvalArguments(request.arguments)}\n`);
+  if (destructive) write("HIGH RISK: This action may be irreversible.\n");
+  const line = createLine();
+  try {
+    const answer = await line.question(`Approve? Type exactly ${required}: `);
+    return answer === required ? { approved: true, reason: "user approved" } : { approved: false, reason: "user declined" };
+  } catch { return { approved: false, reason: "user declined" }; }
+  finally { line.close(); }
+}
 
 /** Removes terminal control input from untrusted model text while retaining layout. */
 export function sanitizeMarkdown(text: string): string {

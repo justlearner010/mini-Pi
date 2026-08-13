@@ -6,10 +6,10 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { Agent, type AgentEvent } from "./agent.js";
+import { Agent, type AgentEvent, type RequestApproval } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
 import { tools } from "./tool.js";
-import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, startTui, type TuiSession } from "./tui.js";
+import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
 export type ValidatedOptions = CliOptions & { rootDir?: string; apiKey?: string; error?: string };
@@ -194,8 +194,8 @@ For full-project analysis, include:
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
 function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
-function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, onEvent: (event: AgentEvent) => void): Agent {
-  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent });
+function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
+  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
 }
 
 export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env, credentials?: CredentialStore): Promise<ValidatedOptions> {
@@ -226,7 +226,8 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
     } else if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env, systemCredentials);
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: new Agent({ llm: createLLM({ provider: selection.provider, model: selection.model, apiKey }), tools, rootDir: valid.rootDir!, systemPrompt: SYSTEM_PROMPT, messages: history, onEvent: (event) => { const text = formatEvent(event, debugEnabled(env)); if (text) console.log(text); } }) });
+  const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, (event) => { const text = formatEvent(event, debugEnabled(env)); if (text) console.log(text); }, requestApproval, history) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
   if (valid.prompt) { try { console.log((await session.agent.run(valid.prompt)).answer); return 0; } catch { return 1; } }
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {

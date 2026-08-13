@@ -21,7 +21,49 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, type TuiRuntime } from "../src/tui.js";
+import type { ApprovalRequest } from "../src/agent.js";
+
+function approvalRequest(permission: ApprovalRequest["permission"], argumentsValue: unknown = { path: "secret.txt" }): ApprovalRequest {
+  return { toolName: "guarded_tool", permission, reason: "Needs your permission", risk: "Changes project state", arguments: argumentsValue };
+}
+
+test("terminal approval requires exact confirmation words and displays request details", async () => {
+  const outputs: string[] = [];
+  const answers = ["y", "yes", "", "yes", "y"];
+  let closed = 0;
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => answers.shift()!, close: () => { closed += 1; } }),
+    write: (text) => { outputs.push(text); }
+  };
+
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE"), runtime), { approved: true, reason: "user approved" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE"), runtime), { approved: false, reason: "user declined" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE"), runtime), { approved: false, reason: "user declined" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("DESTRUCTIVE"), runtime), { approved: true, reason: "user approved" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("DESTRUCTIVE"), runtime), { approved: false, reason: "user declined" });
+  assert.equal(closed, 5);
+  const text = outputs.join("");
+  assert.match(text, /Tool: guarded_tool/);
+  assert.match(text, /Reason: Needs your permission/);
+  assert.match(text, /Risk: Changes project state/);
+  assert.match(text, /"path": "secret.txt"/);
+  assert.match(text, /HIGH RISK/);
+});
+
+test("terminal approval rejects input failures and unavailable arguments safely", async () => {
+  const outputs: string[] = [];
+  const failures = [{ code: "EOF" }, { code: "SIGINT" }, new Error("prompt failed")];
+  let closed = 0;
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => Promise.reject(failures.shift()), close: () => { closed += 1; } }),
+    write: (text) => { outputs.push(text); }
+  };
+  const circular: { self?: unknown } = {}; circular.self = circular;
+  for (let index = 0; index < 3; index += 1) assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE", circular), runtime), { approved: false, reason: "user declined" });
+  assert.equal(closed, 3);
+  assert.match(outputs.join(""), /\[unavailable\]/);
+});
 
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
