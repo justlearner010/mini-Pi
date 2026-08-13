@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { Agent, type AgentEvent } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
 import { tools } from "./tool.js";
-import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, startTui, TuiView, type TuiSession } from "./tui.js";
+import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, startTui, TuiView, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
 export type ValidatedOptions = CliOptions & { rootDir?: string; apiKey?: string; error?: string };
@@ -198,6 +198,11 @@ function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model"
   return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, messages });
 }
 
+export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log): Promise<number> {
+  try { write((await agent.run(prompt)).answer); return 0; }
+  catch { return 1; }
+}
+
 export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env, credentials?: CredentialStore): Promise<ValidatedOptions> {
   const provider = valid.provider ?? await deps.chooseProvider();
   const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, env, valid.rootDir, credentials);
@@ -226,10 +231,16 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
     } else if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env, systemCredentials);
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
+  if (valid.prompt) {
+    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, (event) => {
+      const text = formatEvent(event, debugEnabled(env));
+      if (text) console.log(text);
+    });
+    return runOneShot(agent, valid.prompt);
+  }
   const view = new TuiView({ write: (text) => process.stdout.write(text), provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
   const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, view.onEvent.bind(view), history) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
-  if (valid.prompt) { try { console.log((await session.agent.run(valid.prompt)).answer); return 0; } catch { return 1; } }
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {
     login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
     model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.agent.history()); },

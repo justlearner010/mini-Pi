@@ -15,6 +15,7 @@ import {
   parseArgs,
   readGlobalPreference,
   resolveApiKey,
+  runOneShot,
   selectAndSaveModel,
   saveGlobalPreference,
   SYSTEM_PROMPT,
@@ -22,6 +23,15 @@ import {
   validateOptions
 } from "../src/cli.js";
 import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
+
+test("one-shot prompt uses the plain CLI transcript and prints its answer once", async () => {
+  const output: string[] = [];
+  const agent = { async run() { return { answer: "final answer", messages: [], turns: 1 }; } } as never;
+  assert.equal(await runOneShot(agent, "question", (text) => output.push(`${text}\n`)), 0);
+  const text = output.join("");
+  assert(!text.includes("YOU:") && !text.includes("MINI-PI") && !text.includes("activity"));
+  assert.equal((text.match(/final answer/g) ?? []).length, 1);
+});
 
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
