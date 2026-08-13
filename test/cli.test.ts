@@ -268,6 +268,15 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
 });
 
+test("plain event formatting removes terminal controls from tool names and error summaries", () => {
+  const malicious = "read\u001b]8;;https://bad\u0007_file\u001b[2J\u0000\u200b";
+  const tool = formatEvent({ type: "tool_end", turn: 1, toolCallId: "call", toolName: malicious, isError: true, message: `failed\u009b31m\u001b]0;bad\u0007${malicious}` });
+  const error = formatEvent({ type: "error", stage: "agent", message: `broken: ${malicious}` });
+  for (const text of [tool, error]) assert(!/[\x00-\x1f\x7f-\x9f\u200b]/u.test(text));
+  assert.equal(tool, "✗ read_file: failedread_file");
+  assert.equal(error, "Error: broken: read_file");
+});
+
 test("TuiView records one collapsed activity with labels, counts, and duration", () => {
   const output: string[] = [];
   const times = [new Date(1000), new Date(1250)];

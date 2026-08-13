@@ -210,6 +210,11 @@ export function parseCommand(input: string): TuiCommand {
 }
 
 export function formatEvent(event: AgentEvent, debug = false): string {
+  const text = formatUnsafeEvent(event, debug);
+  return sanitizePlainText(text);
+}
+
+function formatUnsafeEvent(event: AgentEvent, debug: boolean): string {
   if (event.type === "agent_start") return "Working...";
   if (event.type === "model_start") return `Thinking (turn ${event.turn})...`;
   if (event.type === "model_end") return event.toolCallCount ? `Using ${event.toolCallCount} tool(s)...` : "";
