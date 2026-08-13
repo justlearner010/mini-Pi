@@ -61,7 +61,7 @@ test("SAFE tools execute without requesting approval", async () => {
   const fake = fakeLLM([response(null, [{ id: "safe", name: "safe", arguments: '{"value":1}' }]), response("done")]);
   let executions = 0;
   let approvals = 0;
-  const agent = new Agent({ llm: fake.llm, tools: [tool("safe", async () => { executions += 1; return { content: "ok", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => { approvals += 1; return true; } });
+  const agent = new Agent({ llm: fake.llm, tools: [tool("safe", async () => { executions += 1; return { content: "ok", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => { approvals += 1; return { approved: true, reason: "not needed" }; } });
   await agent.run("go");
   assert.equal(executions, 1);
   assert.equal(approvals, 0);
@@ -71,22 +71,22 @@ test("approved SENSITIVE tools receive the complete request then execute", async
   const fake = fakeLLM([response(null, [{ id: "sensitive", name: "guarded", arguments: '{"path":"secrets.txt"}' }]), response("done")]);
   const approvals: ApprovalRequest[] = [];
   let executions = 0;
-  const agent = new Agent({ llm: fake.llm, tools: [approvalTool("SENSITIVE", async () => { executions += 1; return { content: "ok", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async (request) => { approvals.push(request); return true; } });
+  const agent = new Agent({ llm: fake.llm, tools: [approvalTool("SENSITIVE", async () => { executions += 1; return { content: "ok", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async (request) => { approvals.push(request); return { approved: true, reason: "confirmed" }; } });
   await agent.run("go");
   assert.equal(executions, 1);
   assert.deepEqual(approvals, [{ toolName: "guarded", permission: "SENSITIVE", reason: "This operation needs explicit approval", risk: "medium", arguments: { path: "secrets.txt" } }]);
 });
 
-test("declined tools do not execute and return the approval error to the next model turn", async () => {
+test("object approval decisions deny tools without executing and return the decision reason", async () => {
   const fake = fakeLLM([response(null, [{ id: "declined", name: "guarded", arguments: "{}" }]), response("recovered")]);
   const events: AgentEvent[] = [];
   let executions = 0;
-  const agent = new Agent({ llm: fake.llm, tools: [approvalTool("DESTRUCTIVE", async () => { executions += 1; return { content: "bad", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => false, onEvent: (event) => events.push(event) });
+  const agent = new Agent({ llm: fake.llm, tools: [approvalTool("DESTRUCTIVE", async () => { executions += 1; return { content: "bad", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => ({ approved: false, reason: "not now" }), onEvent: (event) => events.push(event) });
   assert.equal((await agent.run("go")).answer, "recovered");
   assert.equal(executions, 0);
-  assert.deepEqual(fake.requests[1].at(-1), { role: "tool", toolCallId: "declined", content: "Tool error: User declined guarded: This operation needs explicit approval" });
+  assert.deepEqual(fake.requests[1].at(-1), { role: "tool", toolCallId: "declined", content: "Tool error: User declined guarded: not now" });
   assert.deepEqual(events.filter((event) => event.type === "tool_start" || event.type === "tool_end"), [
-    { type: "tool_end", turn: 1, toolCallId: "declined", toolName: "guarded", isError: true, message: "User declined guarded: This operation needs explicit approval" }
+    { type: "tool_end", turn: 1, toolCallId: "declined", toolName: "guarded", isError: true, message: "User declined guarded: not now" }
   ]);
 });
 
@@ -115,6 +115,17 @@ test("recovers from unknown tools, malformed arguments, and tool failures", asyn
   const results = fake.requests[1].filter((message) => message.role === "tool");
   assert.equal(results.length, 3);
   assert(results.every((message) => message.role === "tool" && /error/i.test(message.content)));
+});
+
+test("unknown and malformed tool calls emit only error endings", async () => {
+  const fake = fakeLLM([response(null, [{ id: "unknown", name: "nope", arguments: "{}" }, { id: "bad", name: "ok", arguments: "{" }]), response("recovered")]);
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ llm: fake.llm, tools: [tool("ok", async () => ({ content: "ok", isError: false }))], systemPrompt: "rules", rootDir: "/project", onEvent: (event) => events.push(event) });
+  await agent.run("go");
+  assert.deepEqual(events.filter((event) => event.type === "tool_start" || event.type === "tool_end"), [
+    { type: "tool_end", turn: 1, toolCallId: "unknown", toolName: "nope", isError: true, message: "Unknown tool: nope" },
+    { type: "tool_end", turn: 1, toolCallId: "bad", toolName: "ok", isError: true, message: "Malformed tool arguments" }
+  ]);
 });
 
 test("emits lifecycle events including tool events", async () => {

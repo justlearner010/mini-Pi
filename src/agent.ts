@@ -9,7 +9,10 @@ export interface ApprovalRequest {
   arguments: unknown;
 }
 
-export type ApprovalDecision = boolean;
+export interface ApprovalDecision {
+  approved: boolean;
+  reason: string;
+}
 export type RequestApproval = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
 export type AgentEvent =
@@ -106,17 +109,17 @@ export class Agent {
       let args: unknown;
       try { args = JSON.parse(call.arguments); }
       catch { throw new Error("Malformed tool arguments"); }
-      const permission = tool.permission ?? "SAFE";
+      const permission = tool.permission;
       if (permission !== "SAFE") {
         let approved: ApprovalDecision;
         try {
           if (!this.requestApproval) throw new Error("approval unavailable");
-          approved = await this.requestApproval({ toolName: tool.name, permission, reason: tool.reason ?? "", risk: tool.risk ?? "", arguments: args });
+          approved = await this.requestApproval({ toolName: tool.name, permission, reason: tool.reason, risk: tool.risk, arguments: args });
         } catch (error) {
           const reason = error instanceof Error && error.message === "approval unavailable" ? error.message : "approval failed";
           throw new Error(`User declined ${tool.name}: ${reason}`);
         }
-        if (!approved) throw new Error(`User declined ${tool.name}: ${tool.reason ?? ""}`);
+        if (!approved.approved) throw new Error(`User declined ${tool.name}: ${approved.reason}`);
       }
       this.emit({ type: "tool_start", turn, toolCallId: call.id, toolName: call.name });
       const output = await tool.execute(args, { rootDir: this.rootDir });
@@ -124,7 +127,6 @@ export class Agent {
       result = output.isError ? `Tool error: ${content(output.content)}` : content(output.content);
       message = output.isError ? summary(output.content) : "completed";
     } catch (error) {
-      if (!tool || (tool.permission ?? "SAFE") === "SAFE") this.emit({ type: "tool_start", turn, toolCallId: call.id, toolName: call.name });
       isError = true;
       message = error instanceof Error ? error.message : "Tool failed";
       result = `Tool error: ${message}`;

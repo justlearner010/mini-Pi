@@ -18,9 +18,9 @@ export interface Tool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  permission?: ToolPermission;
-  reason?: string;
-  risk?: string;
+  permission: ToolPermission;
+  reason: string;
+  risk: string;
   execute(args: unknown, context: ToolContext): Promise<ToolResult>;
 }
 
