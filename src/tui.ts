@@ -4,7 +4,7 @@ import select from "@inquirer/select";
 import password from "@inquirer/password";
 import { render as renderWithMarkdansi } from "markdansi";
 
-import type { Agent, AgentEvent } from "./agent.js";
+import type { Agent, AgentEvent, ApprovalDecision, ApprovalRequest } from "./agent.js";
 import type { ProviderName } from "./llm.js";
 
 export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
@@ -15,12 +15,33 @@ export type MarkdownRenderer = (text: string) => string;
 export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
 export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; provider?: ProviderName; renderMarkdown?: MarkdownRenderer };
 
-const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
+const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", approval: "\x1b[38;5;179m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
 
 /** Removes terminal controls and invisible formatting from plain TUI fields. */
 export function sanitizePlainText(text: string): string {
   return sanitizeMarkdown(text)
     .replace(/[\p{Default_Ignorable_Code_Point}]/gu, "");
+}
+
+function approvalArguments(argumentsValue: unknown): string {
+  try { return sanitizePlainText(JSON.stringify(argumentsValue, null, 2) ?? "[unavailable]"); }
+  catch { return "[unavailable]"; }
+}
+
+/** Prompts locally for an Agent tool permission decision; every unexpected input fails closed. */
+export async function requestTerminalApproval(request: ApprovalRequest, runtime: TuiRuntime = {}): Promise<ApprovalDecision> {
+  const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
+  const write = runtime.write ?? ((text: string) => { stdout.write(text); });
+  const destructive = request.permission === "DESTRUCTIVE";
+  const required = destructive ? "yes" : "y";
+  const text = `Tool: ${sanitizePlainText(request.toolName)}\nReason: ${sanitizePlainText(request.reason)}\nRisk: ${sanitizePlainText(request.risk)}\nArguments:\n${approvalArguments(request.arguments)}\n`;
+  write(`${tuiColor.approval}${text}${destructive ? "HIGH RISK: This action may be irreversible.\n" : ""}${tuiColor.reset}`);
+  const line = createLine();
+  try {
+    const answer = await line.question(`Approve? Type exactly ${required}: `);
+    return answer === required ? { approved: true, reason: "user approved" } : { approved: false, reason: "user declined" };
+  } catch { return { approved: false, reason: "user declined" }; }
+  finally { line.close(); }
 }
 
 export type ActivityItem = { text: string; isError: boolean };
@@ -38,6 +59,7 @@ export class TuiView {
   private readonly provider: ProviderName;
   private activity: Activity[] = [];
   private currentActivity: ActiveActivity | undefined;
+  private answerRendered = false;
 
   constructor(runtime: TuiViewRuntime) {
     this.write = runtime.write;
@@ -48,6 +70,7 @@ export class TuiView {
 
   onEvent(event: AgentEvent): void {
     if (event.type === "agent_start") {
+      this.answerRendered = false;
       this.currentActivity = { turnCount: 0, toolCount: 0, durationMs: 0, items: [], expanded: false, startedAt: this.now() };
       this.writeLayer("user", `YOU: ${sanitizePlainText(event.prompt)}`);
       return;
@@ -60,7 +83,7 @@ export class TuiView {
     if (event.type === "model_end" || event.type === "agent_end") {
       if (event.type === "agent_end") {
         if (this.currentActivity) this.currentActivity.turnCount = event.turns;
-        if (event.answer) this.renderAnswer(event.answer, event.turns);
+        if (event.answer) { this.renderAnswer(event.answer, event.turns); this.answerRendered = true; }
         this.finishActivity();
       }
       return;
@@ -91,6 +114,10 @@ export class TuiView {
     this.currentActivity = undefined;
   }
 
+  renderTurn(_prompt: string, answer: string, turns: number): void {
+    if (!this.answerRendered) this.renderAnswer(answer, turns);
+  }
+
   private addActivity(text: string, isError: boolean, isToolStart = false): void {
     if (!this.currentActivity) return;
     this.currentActivity.items.push({ text, isError });
@@ -100,7 +127,7 @@ export class TuiView {
   private renderAnswer(answer: string, turns: number): void {
     const label = `MINI-PI · ${this.provider} · ${turns} turns`;
     try { this.writeLayer("assistant", `${label}\n${renderMarkdown(answer, this.markdown)}`); }
-    catch { this.writeLayer("assistant", `${label}\n${sanitizeMarkdown(answer)}`); }
+    catch { this.writeLayer("assistant", `${label}\nMarkdown rendering failed; showing safe plain text.\n${sanitizeMarkdown(answer)}`); }
   }
 
   private finishActivity(): void {
@@ -118,7 +145,7 @@ export class TuiView {
     this.writeLayer("activity", `${label}${details}`);
   }
 
-  private writeLayer(layer: "user" | "assistant" | "activity" | "error", text: string): void {
+  private writeLayer(layer: "user" | "assistant" | "activity" | "approval" | "error", text: string): void {
     this.write(`${tuiColor[layer]}${text}${tuiColor.reset}\n`);
   }
 }
@@ -200,7 +227,7 @@ export function helpText(project: string, provider: ProviderName, model: string)
   return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /help, /reset, /exit`;
 }
 
-export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions, runtime: TuiRuntime = {}): Promise<number> {
+export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions, runtime: TuiRuntime = {}, view = new TuiView({ write: runtime.write ?? ((text) => { stdout.write(text); }), provider: config.provider, renderMarkdown: runtime.renderMarkdown })): Promise<number> {
   const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
   const write = runtime.write ?? ((text: string) => { stdout.write(text); });
   let session: TuiSession = { agent, provider: config.provider, model: config.model };
@@ -216,8 +243,8 @@ export async function startTui(agent: Agent, config: { project: string; provider
       const command = parseCommand(input);
       if (command.type === "exit") return 0;
       if (command.type === "help") { write(`${helpText(config.project, session.provider, session.model)}\n`); continue; }
-      if (command.type === "reset") { session.agent.reset(); write("Conversation reset.\n"); continue; }
-      if (command.type === "empty") { write("Enter a question or /help.\n"); continue; }
+      if (command.type === "reset") { session.agent.reset(); view.clearActivity(); write("Conversation reset.\n"); continue; }
+      if (command.type === "empty") { view.toggleLatestActivity(); continue; }
       if (command.type === "unknown") { write(`Unknown command: ${command.command}\n`); continue; }
       if (command.type === "login" || command.type === "model") {
         try { session = command.type === "login" ? await actions!.login(session) : await actions!.model(session); write(`Using ${session.provider} / ${session.model}.\n`); }
@@ -232,9 +259,8 @@ export async function startTui(agent: Agent, config: { project: string; provider
       if (command.type !== "prompt") continue;
       try {
         const result = await session.agent.run(command.prompt);
-        try { write(`${renderMarkdown(result.answer, runtime.renderMarkdown)}\n`); }
-        catch { write(`Markdown rendering failed; showing safe plain text.\n${sanitizeMarkdown(result.answer)}\n`); }
+        view.renderTurn(command.prompt, result.answer, result.turns);
       }
-      catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
+      catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) view.onEvent({ type: "error", stage: "agent", message: error instanceof Error ? error.message : "Agent failed" }); }
   }
 }

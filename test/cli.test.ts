@@ -21,7 +21,7 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
 
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
@@ -53,6 +53,22 @@ test("removes controls decoded from Markdown entities and disables terminal hype
 
 test("does not turn model-controlled private-use characters into terminal styles", () => {
   assert.equal(renderMarkdown("\uE00031\uE001", (text) => text), "\uE00031\uE001");
+});
+
+test("terminal approval uses the amber layer, sanitizes details, and keeps exact confirmation", async () => {
+  const output: string[] = [];
+  let closed = false;
+  const result = await requestTerminalApproval({
+    toolName: "guard\u001b[2Jed", permission: "SENSITIVE", reason: "need\u200b permission", risk: "low", arguments: { path: "a\u001b]8;;bad\u0007" }
+  }, {
+    createLine: () => ({ question: async () => "yes", close: () => { closed = true; } }),
+    write: (text) => output.push(text)
+  });
+  assert.deepEqual(result, { approved: false, reason: "user declined" });
+  assert.equal(closed, true);
+  const text = output.join("");
+  assert.match(text, /\x1b\[38;5;179mTool: guarded/);
+  assert(!text.includes("\u001b]8;") && !text.includes("\u001b[2J") && !text.includes("\u200b"));
 });
 
 test("TUI renders only final answers and falls back to safe plain text", async () => {
@@ -88,6 +104,57 @@ test("TUI does not send agent errors through the Markdown renderer", async () =>
   await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime);
   assert.equal(renders, 0);
   assert(output.join("").includes("Error: tool error: **not markdown**"));
+});
+
+test("layered TUI integration toggles completed activity, resets it, and still submits text", async () => {
+  const output: string[] = [];
+  const inputs = ["question", "", "", "/reset", "", "/exit"];
+  let runs = 0;
+  const view = new TuiView({ write: (text) => output.push(text), provider: "openai", renderMarkdown: (text) => `md:${text}` });
+  const agent = {
+    reset() {},
+    async run(prompt: string) {
+      runs += 1;
+      sink({ type: "agent_start", prompt });
+      sink({ type: "model_start", turn: 1 });
+      sink({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+      sink({ type: "tool_end", turn: 1, toolCallId: "a", toolName: "read_file", isError: false, message: "completed" });
+      sink({ type: "agent_end", answer: "answer", turns: 1 });
+      return { answer: "answer", messages: [], turns: 1 };
+    }
+  } as never;
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = () => undefined;
+  sink = view.onEvent.bind(view);
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => output.push(text)
+  };
+  await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime, view);
+  assert.equal(runs, 1);
+  const text = output.join("");
+  assert.match(text, /YOU: question/);
+  assert.match(text, /MINI-PI · openai · 1 turns\nmd:answer/);
+  assert.match(text, /▸ activity · 1 tools/);
+  assert.match(text, /▾ activity · 1 tools[\s\S]*→ read_file[\s\S]*✓ read_file/);
+  assert.equal((text.match(/Enter a question/g) ?? []).length, 0);
+});
+
+test("layered TUI integration keeps its event sink when login or model replaces an agent", async () => {
+  const output: string[] = [];
+  const inputs = ["/login", "/model", "/exit"];
+  const view = new TuiView({ write: (text) => output.push(text), provider: "openai" });
+  const original = { reset() {} } as never;
+  const replacements: unknown[] = [];
+  const replacement = { reset() {} } as never;
+  await startTui(original, { project: "/project", provider: "openai", model: "old" }, {
+    login: async (session) => { replacements.push(session.agent); return { ...session, agent: replacement }; },
+    model: async (session) => { replacements.push(session.agent); return { ...session, agent: replacement, model: "new" }; },
+    logout: async () => undefined
+  }, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => output.push(text)
+  }, view);
+  assert.deepEqual(replacements, [original, replacement]);
 });
 
 test("interactive command releases its prompt and returns to the next prompt", async () => {
