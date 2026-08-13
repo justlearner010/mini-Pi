@@ -1,5 +1,19 @@
 import { ProviderDiagnostic, type LLMClient, type Message, type ProviderDiagnosticData, type ToolCall } from "./llm.js";
-import type { Tool } from "./tool.js";
+import type { Tool, ToolPermission } from "./tool.js";
+
+export interface ApprovalRequest {
+  toolName: string;
+  permission: "SENSITIVE" | "DESTRUCTIVE";
+  reason: string;
+  risk: string;
+  arguments: unknown;
+}
+
+export interface ApprovalDecision {
+  approved: boolean;
+  reason: string;
+}
+export type RequestApproval = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
 export type AgentEvent =
   | { type: "agent_start"; prompt: string }
@@ -16,6 +30,7 @@ export interface AgentConfig {
   rootDir: string;
   maxTurns?: number;
   onEvent?: (event: AgentEvent) => void;
+  requestApproval?: RequestApproval;
   messages?: Message[];
 }
 export interface AgentResult { answer: string; messages: Message[]; turns: number; }
@@ -26,6 +41,10 @@ function content(value: unknown): string {
   return serialized ?? "";
 }
 function summary(value: unknown): string { return content(value).slice(0, 200); }
+function isToolPermission(value: unknown): value is ToolPermission { return value === "SAFE" || value === "SENSITIVE" || value === "DESTRUCTIVE"; }
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return typeof value === "object" && value !== null && "approved" in value && "reason" in value && typeof value.approved === "boolean" && typeof value.reason === "string";
+}
 
 export class Agent {
   private readonly llm: LLMClient;
@@ -34,6 +53,7 @@ export class Agent {
   private readonly rootDir: string;
   private readonly maxTurns: number;
   private readonly onEvent?: (event: AgentEvent) => void;
+  private readonly requestApproval?: RequestApproval;
   private messages: Message[];
 
   constructor(config: AgentConfig) {
@@ -43,6 +63,7 @@ export class Agent {
     this.rootDir = config.rootDir;
     this.maxTurns = config.maxTurns ?? 8;
     this.onEvent = config.onEvent;
+    this.requestApproval = config.requestApproval;
     this.messages = structuredClone(config.messages ?? [{ role: "system", content: this.systemPrompt }]);
   }
 
@@ -85,7 +106,6 @@ export class Agent {
   }
 
   private async execute(call: ToolCall, turn: number): Promise<void> {
-    this.emit({ type: "tool_start", turn, toolCallId: call.id, toolName: call.name });
     const tool = this.tools.find((item) => item.name === call.name);
     let result: string, isError: boolean, message: string;
     try {
@@ -93,6 +113,22 @@ export class Agent {
       let args: unknown;
       try { args = JSON.parse(call.arguments); }
       catch { throw new Error("Malformed tool arguments"); }
+      const permission = tool.permission;
+      if (!isToolPermission(permission)) throw new Error(`User declined ${tool.name}: approval failed`);
+      if (permission !== "SAFE") {
+        let approved: ApprovalDecision;
+        try {
+          if (!this.requestApproval) throw new Error("approval unavailable");
+          const decision = await this.requestApproval({ toolName: tool.name, permission, reason: tool.reason, risk: tool.risk, arguments: args });
+          if (!isApprovalDecision(decision)) throw new Error("approval failed");
+          approved = decision;
+        } catch (error) {
+          const reason = error instanceof Error && error.message === "approval unavailable" ? error.message : "approval failed";
+          throw new Error(`User declined ${tool.name}: ${reason}`);
+        }
+        if (!approved.approved) throw new Error(`User declined ${tool.name}: approval denied`);
+      }
+      this.emit({ type: "tool_start", turn, toolCallId: call.id, toolName: call.name });
       const output = await tool.execute(args, { rootDir: this.rootDir });
       isError = output.isError;
       result = output.isError ? `Tool error: ${content(output.content)}` : content(output.content);

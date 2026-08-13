@@ -22,7 +22,8 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
+import type { ApprovalRequest } from "../src/agent.js";
 
 test("one-shot prompt uses the plain CLI transcript and prints its answer once", async () => {
   const output: string[] = [];
@@ -31,6 +32,82 @@ test("one-shot prompt uses the plain CLI transcript and prints its answer once",
   const text = output.join("");
   assert(!text.includes("YOU:") && !text.includes("MINI-PI") && !text.includes("activity"));
   assert.equal((text.match(/final answer/g) ?? []).length, 1);
+});
+
+function approvalRequest(permission: ApprovalRequest["permission"], argumentsValue: unknown = { path: "secret.txt" }): ApprovalRequest {
+  return { toolName: "guarded_tool", permission, reason: "Needs your permission", risk: "Changes project state", arguments: argumentsValue };
+}
+
+test("terminal approval requires exact confirmation words and displays request details", async () => {
+  const outputs: string[] = [];
+  const answers = ["y", "yes", "", "yes", "y"];
+  let closed = 0;
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => answers.shift()!, close: () => { closed += 1; } }),
+    write: (text) => { outputs.push(text); }
+  };
+
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE"), runtime), { approved: true, reason: "user approved" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE"), runtime), { approved: false, reason: "user declined" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE"), runtime), { approved: false, reason: "user declined" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("DESTRUCTIVE"), runtime), { approved: true, reason: "user approved" });
+  assert.deepEqual(await requestTerminalApproval(approvalRequest("DESTRUCTIVE"), runtime), { approved: false, reason: "user declined" });
+  assert.equal(closed, 5);
+  const text = outputs.join("");
+  assert.match(text, /Tool: guarded_tool/);
+  assert.match(text, /Reason: Needs your permission/);
+  assert.match(text, /Risk: Changes project state/);
+  assert.match(text, /"path": "secret.txt"/);
+  assert.match(text, /HIGH RISK/);
+});
+
+test("terminal approval rejects input failures and unavailable arguments safely", async () => {
+  const outputs: string[] = [];
+  const failures = [{ code: "EOF" }, { code: "SIGINT" }, new Error("prompt failed")];
+  let closed = 0;
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => Promise.reject(failures.shift()), close: () => { closed += 1; } }),
+    write: (text) => { outputs.push(text); }
+  };
+  const circular: { self?: unknown } = {}; circular.self = circular;
+  for (let index = 0; index < 3; index += 1) assert.deepEqual(await requestTerminalApproval(approvalRequest("SENSITIVE", circular), runtime), { approved: false, reason: "user declined" });
+  assert.equal(closed, 3);
+  assert.match(outputs.join(""), /\[unavailable\]/);
+});
+
+test("terminal approval strips terminal controls and bidi characters from untrusted request text", async () => {
+  const output: string[] = [];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => "no", close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await requestTerminalApproval({
+    toolName: "guarded\u001b]0;spoof\u0007\u009b2J\u202ereversed",
+    permission: "SENSITIVE",
+    reason: "reason\u001b[2J\u200bhidden",
+    risk: "risk\u009d8;;bad\u009c\u2066isolated",
+    arguments: { path: "safe\u001b[31mtext\u001b[0m\u202e.txt" }
+  }, runtime);
+  const rendered = output.join("");
+  assert(!/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/.test(rendered));
+  assert.match(rendered, /Tool: guardedreversed/);
+  assert.match(rendered, /"path": "safetext.txt"/);
+});
+
+test("terminal approval strips every default-ignorable Unicode character from untrusted details", async () => {
+  const output: string[] = [];
+  const invisible = "\u061c\u180e\u034f\ufe0f\udb40\udd00";
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => "no", close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await requestTerminalApproval({
+    toolName: `tool${invisible}name`, permission: "SENSITIVE", reason: `reason${invisible}text`, risk: `risk${invisible}text`, arguments: { path: `file${invisible}.txt` }
+  }, runtime);
+  const rendered = output.join("");
+  assert(!/\p{Default_Ignorable_Code_Point}/u.test(rendered));
+  assert.match(rendered, /Tool: toolname/);
+  assert.match(rendered, /"path": "file.txt"/);
 });
 
 test("renders common Markdown answer text without leaving formatting markers", () => {

@@ -12,7 +12,7 @@ function fakeClient(reply: unknown, models: string[] = ["z", "a", "z"]): Provide
   };
 }
 
-const tools = [{ name: "read_file", description: "Read", parameters: { type: "object" }, execute: async () => ({ content: "", isError: false }) }];
+const tools = [{ name: "read_file", description: "Read", parameters: { type: "object" }, permission: "SAFE" as const, reason: "Only reads files", risk: "low", execute: async () => ({ content: "", isError: false }) }];
 
 test("generate converts every message role, tools, null content, and multiple tool calls", async () => {
   const client = fakeClient({ choices: [{ message: { content: null, tool_calls: [

@@ -4,7 +4,7 @@ import select from "@inquirer/select";
 import password from "@inquirer/password";
 import { render as renderWithMarkdansi } from "markdansi";
 
-import type { Agent, AgentEvent } from "./agent.js";
+import type { Agent, AgentEvent, ApprovalDecision, ApprovalRequest } from "./agent.js";
 import type { ProviderName } from "./llm.js";
 
 export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
@@ -159,6 +159,44 @@ export class TuiView {
   private writeLayer(layer: "user" | "assistant" | "activity" | "approval" | "error", text: string): void {
     this.write(`${tuiColor[layer]}${text}${tuiColor.reset}\n`);
   }
+}
+
+const MAX_APPROVAL_FIELD_LENGTH = 500;
+const MAX_APPROVAL_ARGUMENTS_LENGTH = 4_000;
+
+/** Makes untrusted approval details safe for a terminal while retaining structural JSON newlines. */
+function sanitizeApprovalDisplay(text: string, maximumLength: number, preserveNewlines = false): string {
+  const withoutTerminalSequences = text
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
+    .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "");
+  const controls = preserveNewlines ? /[\x00-\x09\x0b-\x1f\x7f-\x9f]|\p{Default_Ignorable_Code_Point}/gu : /[\x00-\x1f\x7f-\x9f]|\p{Default_Ignorable_Code_Point}/gu;
+  const safe = withoutTerminalSequences.replace(controls, "");
+  return safe.length > maximumLength ? `${safe.slice(0, maximumLength)}… [truncated]` : safe;
+}
+
+function approvalArguments(argumentsValue: unknown): string {
+  try {
+    const serialized = JSON.stringify(argumentsValue, (_key, value) => typeof value === "string" ? sanitizeApprovalDisplay(value, MAX_APPROVAL_FIELD_LENGTH) : value, 2);
+    return sanitizeApprovalDisplay(serialized ?? "[unavailable]", MAX_APPROVAL_ARGUMENTS_LENGTH, true);
+  }
+  catch { return "[unavailable]"; }
+}
+
+/** Prompts locally for an Agent tool permission decision; every unexpected input fails closed. */
+export async function requestTerminalApproval(request: ApprovalRequest, runtime: TuiRuntime = {}): Promise<ApprovalDecision> {
+  const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
+  const write = runtime.write ?? ((text: string) => { stdout.write(text); });
+  const destructive = request.permission === "DESTRUCTIVE";
+  const required = destructive ? "yes" : "y";
+  write(`\nTool: ${sanitizeApprovalDisplay(request.toolName, MAX_APPROVAL_FIELD_LENGTH)}\nReason: ${sanitizeApprovalDisplay(request.reason, MAX_APPROVAL_FIELD_LENGTH)}\nRisk: ${sanitizeApprovalDisplay(request.risk, MAX_APPROVAL_FIELD_LENGTH)}\nArguments:\n${approvalArguments(request.arguments)}\n`);
+  if (destructive) write("HIGH RISK: This action may be irreversible.\n");
+  const line = createLine();
+  try {
+    const answer = await line.question(`Approve? Type exactly ${required}: `);
+    return answer === required ? { approved: true, reason: "user approved" } : { approved: false, reason: "user declined" };
+  } catch { return { approved: false, reason: "user declined" }; }
+  finally { line.close(); }
 }
 
 /** Removes terminal control input from untrusted model text while retaining layout. */
