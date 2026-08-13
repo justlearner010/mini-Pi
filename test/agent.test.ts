@@ -22,7 +22,7 @@ function fakeLLM(replies: Array<ModelResponse | Error>) {
 }
 
 function tool(name: string, execute: Tool["execute"]): Tool {
-  return { name, description: name, parameters: { type: "object" }, permission: "SAFE", reason: "test-only safe tool", risk: "low", execute };
+  return { name, description: name, parameters: { type: "object" }, execute };
 }
 
 test("returns a direct answer and retains shared history", async () => {

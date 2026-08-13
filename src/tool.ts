@@ -11,15 +11,11 @@ export interface ToolResult {
   content: unknown;
   isError: boolean;
 }
-export type ToolPermission = "SAFE" | "SENSITIVE" | "DESTRUCTIVE";
 
 export interface Tool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  permission: ToolPermission;
-  reason: string;
-  risk: string;
   execute(args: unknown, context: ToolContext): Promise<ToolResult>;
 }
 
@@ -110,7 +106,6 @@ async function collectFiles(root: string, directory: string, files: string[]): P
 export const scanProjectTool: Tool = {
   name: "scan_project",
   description: "List relevant project files without leaving the project root.",
-  permission: "SAFE", reason: "Only lists files within the configured project root.", risk: "low",
   parameters: {
     type: "object",
     properties: { path: { type: "string", description: "Optional relative directory to scan" } },
@@ -150,7 +145,6 @@ export const scanProjectTool: Tool = {
 export const readFileTool: Tool = {
   name: "read_file",
   description: "Read a text file safely from the project root.",
-  permission: "SAFE", reason: "Only reads bounded text from within the configured project root.", risk: "low",
   parameters: {
     type: "object",
     properties: {
@@ -349,7 +343,6 @@ function buildEntryTree(entry: string, edges: DependencyEdge[]): string {
 export const analyzeDependenciesTool: Tool = {
   name: "analyze_dependencies",
   description: "Analyze static TypeScript and JavaScript dependency relationships safely.",
-  permission: "SAFE", reason: "Only reads supported source files within the configured project root.", risk: "low",
   parameters: {
     type: "object",
     properties: { path: { type: "string" }, entry: { type: "string" } },
