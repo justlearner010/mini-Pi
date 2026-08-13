@@ -15,14 +15,24 @@ import {
   parseArgs,
   readGlobalPreference,
   resolveApiKey,
+  runOneShot,
   selectAndSaveModel,
   saveGlobalPreference,
   SYSTEM_PROMPT,
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
 import type { ApprovalRequest } from "../src/agent.js";
+
+test("one-shot prompt uses the plain CLI transcript and prints its answer once", async () => {
+  const output: string[] = [];
+  const agent = { async run() { return { answer: "final answer", messages: [], turns: 1 }; } } as never;
+  assert.equal(await runOneShot(agent, "question", (text) => output.push(`${text}\n`)), 0);
+  const text = output.join("");
+  assert(!text.includes("YOU:") && !text.includes("MINI-PI") && !text.includes("activity"));
+  assert.equal((text.match(/final answer/g) ?? []).length, 1);
+});
 
 function approvalRequest(permission: ApprovalRequest["permission"], argumentsValue: unknown = { path: "secret.txt" }): ApprovalRequest {
   return { toolName: "guarded_tool", permission, reason: "Needs your permission", risk: "Changes project state", arguments: argumentsValue };
@@ -167,6 +177,66 @@ test("TUI does not send agent errors through the Markdown renderer", async () =>
   assert(output.join("").includes("Error: tool error: **not markdown**"));
 });
 
+test("layered TUI integration toggles completed activity, resets it, and still submits text", async () => {
+  const output: string[] = [];
+  const inputs = ["question", "", "", "/reset", "", "/exit"];
+  let runs = 0;
+  const view = new TuiView({ write: (text) => output.push(text), provider: "openai", renderMarkdown: (text) => `md:${text}` });
+  const agent = {
+    reset() {},
+    async run(prompt: string) {
+      runs += 1;
+      sink({ type: "agent_start", prompt });
+      sink({ type: "model_start", turn: 1 });
+      sink({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+      sink({ type: "tool_end", turn: 1, toolCallId: "a", toolName: "read_file", isError: false, message: "completed" });
+      sink({ type: "agent_end", answer: "answer", turns: 1 });
+      return { answer: "answer", messages: [], turns: 1 };
+    }
+  } as never;
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = () => undefined;
+  sink = view.onEvent.bind(view);
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => output.push(text)
+  };
+  await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime, view);
+  assert.equal(runs, 1);
+  const text = output.join("");
+  assert.match(text, /YOU: question/);
+  assert.match(text, /MINI-PI · openai · 1 turns\nmd:answer/);
+  assert.match(text, /▸ activity · 1 tools/);
+  assert.match(text, /▾ activity · 1 tools[\s\S]*→ read_file[\s\S]*✓ read_file/);
+  assert.equal((text.match(/Enter a question/g) ?? []).length, 0);
+});
+
+test("layered TUI uses the replacement session provider and model for actual runs", async () => {
+  const output: string[] = [];
+  const inputs = ["/login", "after-login", "/model", "after-model", "/exit"];
+  const view = new TuiView({ write: (text) => output.push(text), provider: "openai" });
+  const agent = (answer: string) => ({ reset() {}, async run(prompt: string) {
+    sink({ type: "agent_start", prompt });
+    sink({ type: "model_start", turn: 1 });
+    sink({ type: "agent_end", answer, turns: 1 });
+    return { answer, messages: [], turns: 1 };
+  } }) as never;
+  const original = agent("original");
+  const loggedIn = agent("login-answer");
+  const modelChanged = agent("model-answer");
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = view.onEvent.bind(view);
+  await startTui(original, { project: "/project", provider: "openai", model: "old" }, {
+    login: async (session) => ({ ...session, agent: loggedIn, provider: "deepseek", model: "chat" }),
+    model: async (session) => ({ ...session, agent: modelChanged, model: "reasoner" }),
+    logout: async () => undefined
+  }, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => output.push(text)
+  }, view);
+  const text = output.join("");
+  assert.match(text, /MINI-PI · deepseek · chat · 1 turns\nlogin-answer/);
+  assert.match(text, /MINI-PI · deepseek · reasoner · 1 turns\nmodel-answer/);
+});
+
 test("interactive command releases its prompt and returns to the next prompt", async () => {
   const inputs = ["/login", "/model", "/logout", "/exit"];
   const closed: number[] = [];
@@ -273,6 +343,126 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "tool_end", turn: 1, toolCallId: "x", toolName: "read_file", isError: false, message: "completed" }), "✓ read_file");
   assert.equal(formatEvent({ type: "error", stage: "model", message: "Model request failed" }), "Error: Model request failed");
   assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
+});
+
+test("plain event formatting removes terminal controls from tool names and error summaries", () => {
+  const malicious = "read\u001b]8;;https://bad\u0007_file\u001b[2J\u0000\u200b";
+  const tool = formatEvent({ type: "tool_end", turn: 1, toolCallId: "call", toolName: malicious, isError: true, message: `failed\u009b31m\u001b]0;bad\u0007${malicious}` });
+  const error = formatEvent({ type: "error", stage: "agent", message: `broken: ${malicious}` });
+  for (const text of [tool, error]) assert(!/[\x00-\x1f\x7f-\x9f\u200b]/u.test(text));
+  assert.equal(tool, "✗ read_file: failedread_file");
+  assert.equal(error, "Error: broken: read_file");
+});
+
+test("TuiView records one collapsed activity with labels, counts, and duration", () => {
+  const output: string[] = [];
+  const times = [new Date(1000), new Date(1250)];
+  const view = new TuiView({ write: (text) => output.push(text), now: () => times.shift()!, provider: "openai", renderMarkdown: (text) => `md:${text}` });
+  view.onEvent({ type: "agent_start", prompt: "inspect src" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+  view.onEvent({ type: "tool_end", turn: 1, toolCallId: "a", toolName: "read_file", isError: false, message: "SECRET TOOL RESULT" });
+  view.onEvent({ type: "agent_end", answer: "# done", turns: 1 });
+  const text = output.join("");
+  assert.match(text, /\x1b\[38;5;110mYOU: inspect src/);
+  assert.match(text, /\x1b\[38;5;141mMINI-PI · openai · 1 turns\nmd:# done/);
+  assert.match(text, /\x1b\[38;5;245m▸ activity · 1 tools · 250ms/);
+  assert.match(text, /· working · turn 1/);
+  assert(!text.includes("Working...") && !text.includes("Thinking") && !text.includes("SECRET TOOL RESULT"));
+});
+
+test("TuiView creates and toggles a collapsed activity for a zero-tool run", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.onEvent({ type: "agent_start", prompt: "hello" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "agent_end", answer: "done", turns: 1 });
+  assert.equal(view.toggleLatestActivity(), true);
+  assert.equal(view.toggleLatestActivity(), false);
+  const text = output.join("");
+  assert.match(text, /▸ activity · 0 tools · \d+ms/);
+  assert.match(text, /▾ activity · 0 tools · \d+ms/);
+});
+
+test("TuiView appends safe tool summaries when toggled and retains them after errors", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.onEvent({ type: "agent_start", prompt: "hello" });
+  view.onEvent({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+  view.onEvent({ type: "error", stage: "agent", message: "bad" });
+  view.onEvent({ type: "agent_end", answer: "", turns: 1 });
+  assert.equal(view.toggleLatestActivity(), true);
+  assert.equal(view.toggleLatestActivity(), false);
+  view.clearActivity();
+  assert.equal(view.toggleLatestActivity(), false);
+  const text = output.join("");
+  assert.match(text, /▾ activity · 1 tools · \d+ms\n→ read_file/);
+  assert.match(text, /▸ activity · 1 tools · \d+ms/);
+  assert.match(text, /\x1b\[38;5;203mError: bad/);
+});
+
+test("TuiView defers a failure until agent_end finalizes activity and startTui does not duplicate it", async () => {
+  const output: string[] = [];
+  const inputs = ["question", "/exit"];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = view.onEvent.bind(view);
+  const agent = { reset() {}, async run(prompt: string) {
+    sink({ type: "agent_start", prompt });
+    sink({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+    sink({ type: "error", stage: "agent", message: "broken" });
+    sink({ type: "agent_end", answer: "", turns: 1 });
+    throw new Error("broken");
+  } } as never;
+  await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => output.push(text)
+  }, view);
+  const text = output.join("");
+  assert(text.indexOf("▸ activity · 1 tools") < text.indexOf("Error: broken"));
+  assert.equal((text.match(/Error: broken/g) ?? []).length, 1);
+});
+
+test("TuiView forwards MINI_PI_DEBUG to diagnostic formatting", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text), debug: true });
+  view.onEvent({ type: "error", stage: "model", turn: 1, message: "limited", diagnostic: { level: "warning", kind: "rate_limit", provider: "openai", message: "limited", reason: "slow down", advice: "retry", status: 429 } });
+  assert.match(output.join(""), /调试：HTTP 429/);
+});
+
+test("TuiView keeps multiple activity records with their own turn counts", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.onEvent({ type: "agent_start", prompt: "one" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "agent_end", answer: "one", turns: 1 });
+  view.onEvent({ type: "agent_start", prompt: "two" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "model_start", turn: 2 });
+  view.onEvent({ type: "tool_start", turn: 2, toolCallId: "b", toolName: "scan_project" });
+  view.onEvent({ type: "tool_end", turn: 2, toolCallId: "b", toolName: "scan_project", isError: false, message: "completed" });
+  view.onEvent({ type: "agent_end", answer: "two", turns: 2 });
+  const text = output.join("");
+  assert.match(text, /MINI-PI · openai · 1 turns/);
+  assert.match(text, /MINI-PI · openai · 2 turns/);
+  assert.equal((text.match(/▸ activity/g) ?? []).length, 2);
+  assert.match(text, /▸ activity · 1 tools · \d+ms/);
+});
+
+test("TuiView strips control and default-ignorable characters from all plain fields", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  const malicious = "ok\u0000\u009b31m\u001b]8;;bad\u0007\u200b\u2060";
+  view.onEvent({ type: "agent_start", prompt: malicious });
+  view.onEvent({ type: "tool_start", turn: 1, toolCallId: malicious, toolName: malicious });
+  view.onEvent({ type: "error", stage: "agent", message: malicious });
+  const text = output.join("").replace(/\x1b\[\d+(?:;\d+)*m/g, "");
+  assert(!/[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b\u2060]/u.test(text));
+  assert(!text.includes("\x1b]") && !text.includes("\x9b"));
+});
+
+test("Markdown output strips default-ignorable characters while retaining trusted SGR", () => {
+  const rendered = renderMarkdown("a\u200b\u2060b", () => "\x1b[35ma\u200b\u2060b\x1b[0m");
+  assert.equal(rendered, "\x1b[35mab\x1b[0m");
 });
 
 test("renders Chinese model diagnostics and only exposes safe debug fields", () => {

@@ -13,6 +13,153 @@ export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; 
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
+export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; provider?: ProviderName; model?: string; debug?: boolean; renderMarkdown?: MarkdownRenderer };
+
+const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", approval: "\x1b[38;5;179m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
+
+/** Removes terminal controls and invisible formatting from plain TUI fields. */
+export function sanitizePlainText(text: string): string {
+  return sanitizeMarkdown(text)
+    .replace(/[\p{Default_Ignorable_Code_Point}]/gu, "");
+}
+
+export type ActivityItem = { text: string; isError: boolean };
+export type Activity = { turnCount: number; toolCount: number; durationMs: number; items: ActivityItem[]; expanded: boolean };
+type ActiveActivity = Activity & { startedAt: Date };
+
+/**
+ * An append-only transcript view. It deliberately does not repaint or stream
+ * model tokens: activity is collected and revealed only on explicit toggle.
+ */
+export class TuiView {
+  private readonly write: (text: string) => void;
+  private readonly now: () => Date;
+  private readonly markdown: MarkdownRenderer;
+  private provider: ProviderName;
+  private model: string | undefined;
+  private readonly debug: boolean;
+  private activity: Activity[] = [];
+  private currentActivity: ActiveActivity | undefined;
+  private answerRendered = false;
+  private pendingError: AgentEvent | undefined;
+  private errorHandled = false;
+
+  constructor(runtime: TuiViewRuntime) {
+    this.write = runtime.write;
+    this.now = runtime.now ?? (() => new Date());
+    this.provider = runtime.provider ?? "openai";
+    this.model = runtime.model;
+    this.debug = runtime.debug ?? false;
+    this.markdown = runtime.renderMarkdown ?? defaultMarkdownRenderer;
+  }
+
+  onEvent(event: AgentEvent): void {
+    if (event.type === "agent_start") {
+      this.answerRendered = false;
+      this.errorHandled = false;
+      this.currentActivity = { turnCount: 0, toolCount: 0, durationMs: 0, items: [], expanded: false, startedAt: this.now() };
+      this.writeLayer("user", `YOU: ${sanitizePlainText(event.prompt)}`);
+      return;
+    }
+    if (event.type === "model_start") {
+      if (this.currentActivity) this.currentActivity.turnCount = event.turn;
+      this.writeLayer("activity", `· working · turn ${event.turn}`);
+      return;
+    }
+    if (event.type === "model_end" || event.type === "agent_end") {
+      if (event.type === "agent_end") {
+        if (this.currentActivity) this.currentActivity.turnCount = event.turns;
+        if (event.answer) { this.renderAnswer(event.answer, event.turns); this.answerRendered = true; }
+        this.finishActivity();
+        this.flushPendingError();
+      }
+      return;
+    }
+    if (event.type === "tool_start") {
+      this.addActivity(`→ ${sanitizePlainText(event.toolName)}`, false, true);
+      return;
+    }
+    if (event.type === "tool_end") {
+      const name = sanitizePlainText(event.toolName);
+      const summary = event.isError ? `: ${sanitizePlainText(event.message)}` : "";
+      this.addActivity(`${event.isError ? "✗" : "✓"} ${name}${summary}`, event.isError);
+      return;
+    }
+    if (this.currentActivity) this.pendingError = event;
+    else {
+      this.writeLayer("error", sanitizePlainText(formatEvent(event, this.debug)));
+      this.errorHandled = true;
+    }
+  }
+
+  updateSession(provider: ProviderName, model: string): void {
+    this.provider = provider;
+    this.model = model;
+  }
+
+  hasHandledError(): boolean { return this.errorHandled || Boolean(this.pendingError); }
+
+  renderUnhandledError(message: string): void {
+    this.pendingError = { type: "error", stage: "agent", message };
+    this.finishActivity();
+    this.flushPendingError();
+  }
+
+  toggleLatestActivity(): boolean {
+    const latest = this.activity.at(-1) ?? this.currentActivity;
+    if (!latest) return false;
+    latest.expanded = !latest.expanded;
+    this.renderActivityState(latest);
+    return latest.expanded;
+  }
+
+  clearActivity(): void {
+    this.activity = [];
+    this.currentActivity = undefined;
+  }
+
+  renderTurn(_prompt: string, answer: string, turns: number): void {
+    if (!this.answerRendered) this.renderAnswer(answer, turns);
+  }
+
+  private addActivity(text: string, isError: boolean, isToolStart = false): void {
+    if (!this.currentActivity) return;
+    this.currentActivity.items.push({ text, isError });
+    if (isToolStart) this.currentActivity.toolCount += 1;
+  }
+
+  private renderAnswer(answer: string, turns: number): void {
+    const label = `MINI-PI · ${this.provider}${this.model ? ` · ${this.model}` : ""} · ${turns} turns`;
+    try { this.writeLayer("assistant", `${label}\n${renderMarkdown(answer, this.markdown)}`); }
+    catch { this.writeLayer("assistant", `${label}\nMarkdown rendering failed; showing safe plain text.\n${sanitizeMarkdown(answer)}`); }
+  }
+
+  private finishActivity(): void {
+    if (!this.currentActivity) return;
+    this.currentActivity.durationMs = Math.max(0, this.now().getTime() - this.currentActivity.startedAt.getTime());
+    const { startedAt: _startedAt, ...activity } = this.currentActivity;
+    this.activity.push(activity);
+    this.currentActivity = undefined;
+    this.renderActivityState(activity);
+  }
+
+  private flushPendingError(): void {
+    if (!this.pendingError) return;
+    this.writeLayer("error", sanitizePlainText(formatEvent(this.pendingError, this.debug)));
+    this.pendingError = undefined;
+    this.errorHandled = true;
+  }
+
+  private renderActivityState(activity: Activity): void {
+    const label = `${activity.expanded ? "▾" : "▸"} activity · ${activity.toolCount} tools · ${activity.durationMs}ms`;
+    const details = activity.expanded ? `\n${activity.items.map((item) => item.text).join("\n")}` : "";
+    this.writeLayer("activity", `${label}${details}`);
+  }
+
+  private writeLayer(layer: "user" | "assistant" | "activity" | "approval" | "error", text: string): void {
+    this.write(`${tuiColor[layer]}${text}${tuiColor.reset}\n`);
+  }
+}
 
 const MAX_APPROVAL_FIELD_LENGTH = 500;
 const MAX_APPROVAL_ARGUMENTS_LENGTH = 4_000;
@@ -70,7 +217,8 @@ export function sanitizeRenderedMarkdown(text: string): string {
     .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
+    .replace(/[\p{Default_Ignorable_Code_Point}]/gu, "");
   const sgr = /\x1b\[(\d{0,3}(?:[;:]\d{0,3})*)m/g;
   let safeText = "", cursor = 0;
   for (const style of text.matchAll(sgr)) {
@@ -100,6 +248,11 @@ export function parseCommand(input: string): TuiCommand {
 }
 
 export function formatEvent(event: AgentEvent, debug = false): string {
+  const text = formatUnsafeEvent(event, debug);
+  return sanitizePlainText(text);
+}
+
+function formatUnsafeEvent(event: AgentEvent, debug: boolean): string {
   if (event.type === "agent_start") return "Working...";
   if (event.type === "model_start") return `Thinking (turn ${event.turn})...`;
   if (event.type === "model_end") return event.toolCallCount ? `Using ${event.toolCallCount} tool(s)...` : "";
@@ -128,7 +281,7 @@ export function helpText(project: string, provider: ProviderName, model: string)
   return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /help, /reset, /exit`;
 }
 
-export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions, runtime: TuiRuntime = {}): Promise<number> {
+export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions, runtime: TuiRuntime = {}, view = new TuiView({ write: runtime.write ?? ((text) => { stdout.write(text); }), provider: config.provider, model: config.model, renderMarkdown: runtime.renderMarkdown })): Promise<number> {
   const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
   const write = runtime.write ?? ((text: string) => { stdout.write(text); });
   let session: TuiSession = { agent, provider: config.provider, model: config.model };
@@ -144,11 +297,11 @@ export async function startTui(agent: Agent, config: { project: string; provider
       const command = parseCommand(input);
       if (command.type === "exit") return 0;
       if (command.type === "help") { write(`${helpText(config.project, session.provider, session.model)}\n`); continue; }
-      if (command.type === "reset") { session.agent.reset(); write("Conversation reset.\n"); continue; }
-      if (command.type === "empty") { write("Enter a question or /help.\n"); continue; }
+      if (command.type === "reset") { session.agent.reset(); view.clearActivity(); write("Conversation reset.\n"); continue; }
+      if (command.type === "empty") { view.toggleLatestActivity(); continue; }
       if (command.type === "unknown") { write(`Unknown command: ${command.command}\n`); continue; }
       if (command.type === "login" || command.type === "model") {
-        try { session = command.type === "login" ? await actions!.login(session) : await actions!.model(session); write(`Using ${session.provider} / ${session.model}.\n`); }
+        try { session = command.type === "login" ? await actions!.login(session) : await actions!.model(session); view.updateSession(session.provider, session.model); write(`Using ${session.provider} / ${session.model}.\n`); }
         catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
         continue;
       }
@@ -160,9 +313,10 @@ export async function startTui(agent: Agent, config: { project: string; provider
       if (command.type !== "prompt") continue;
       try {
         const result = await session.agent.run(command.prompt);
-        try { write(`${renderMarkdown(result.answer, runtime.renderMarkdown)}\n`); }
-        catch { write(`Markdown rendering failed; showing safe plain text.\n${sanitizeMarkdown(result.answer)}\n`); }
+        view.renderTurn(command.prompt, result.answer, result.turns);
       }
-      catch (error) { if (!(error instanceof Error && error.name === "ProviderDiagnostic")) write(`Error: ${error instanceof Error ? error.message : "Agent failed"}\n`); }
+      catch (error) {
+        if (!view.hasHandledError()) view.renderUnhandledError(error instanceof Error ? error.message : "Agent failed");
+      }
   }
 }

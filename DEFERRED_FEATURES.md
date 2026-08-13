@@ -4,7 +4,7 @@
 
 ## LLM 输出
 
-- Token streaming：第一版不逐字输出模型内容。TUI 只展示模型调用、工具执行和最终回答等阶段事件。
+- Token streaming：当前回答仍在一次 Agent 运行完成后才展示，不逐字输出模型内容。
 - Thinking / reasoning 模式，包括保存并回传 DeepSeek 的 `reasoning_content`。
 - OpenAI Responses API；当前统一使用 OpenAI-compatible Chat Completions API。
 - 自动重试、模型回退和 Token 用量统计。
@@ -51,7 +51,7 @@
 
 ## 交互层
 
-- 更复杂的终端组件、快捷键和布局。
+- 真正的原地重渲染、保留式终端组件树，以及跨历史 Activity 的键盘导航；当前空 Enter 只会在追加式转录中展开/收起最近一次活动。
 - TUI 之外的 Web UI 或其他界面。
 - 多行问题编辑、外部编辑器和输入历史持久化。
 - 项目级 Provider 或模型覆盖；当前只保存跨项目的全局默认偏好。
