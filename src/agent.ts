@@ -1,5 +1,5 @@
 import { ProviderDiagnostic, type LLMClient, type Message, type ProviderDiagnosticData, type ToolCall } from "./llm.js";
-import type { Tool } from "./tool.js";
+import type { Tool, ToolPermission } from "./tool.js";
 
 export interface ApprovalRequest {
   toolName: string;
@@ -41,6 +41,10 @@ function content(value: unknown): string {
   return serialized ?? "";
 }
 function summary(value: unknown): string { return content(value).slice(0, 200); }
+function isToolPermission(value: unknown): value is ToolPermission { return value === "SAFE" || value === "SENSITIVE" || value === "DESTRUCTIVE"; }
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return typeof value === "object" && value !== null && "approved" in value && "reason" in value && typeof value.approved === "boolean" && typeof value.reason === "string";
+}
 
 export class Agent {
   private readonly llm: LLMClient;
@@ -110,16 +114,19 @@ export class Agent {
       try { args = JSON.parse(call.arguments); }
       catch { throw new Error("Malformed tool arguments"); }
       const permission = tool.permission;
+      if (!isToolPermission(permission)) throw new Error(`User declined ${tool.name}: approval failed`);
       if (permission !== "SAFE") {
         let approved: ApprovalDecision;
         try {
           if (!this.requestApproval) throw new Error("approval unavailable");
-          approved = await this.requestApproval({ toolName: tool.name, permission, reason: tool.reason, risk: tool.risk, arguments: args });
+          const decision = await this.requestApproval({ toolName: tool.name, permission, reason: tool.reason, risk: tool.risk, arguments: args });
+          if (!isApprovalDecision(decision)) throw new Error("approval failed");
+          approved = decision;
         } catch (error) {
           const reason = error instanceof Error && error.message === "approval unavailable" ? error.message : "approval failed";
           throw new Error(`User declined ${tool.name}: ${reason}`);
         }
-        if (!approved.approved) throw new Error(`User declined ${tool.name}: ${approved.reason}`);
+        if (!approved.approved) throw new Error(`User declined ${tool.name}: approval denied`);
       }
       this.emit({ type: "tool_start", turn, toolCallId: call.id, toolName: call.name });
       const output = await tool.execute(args, { rootDir: this.rootDir });

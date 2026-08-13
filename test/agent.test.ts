@@ -77,17 +77,48 @@ test("approved SENSITIVE tools receive the complete request then execute", async
   assert.deepEqual(approvals, [{ toolName: "guarded", permission: "SENSITIVE", reason: "This operation needs explicit approval", risk: "medium", arguments: { path: "secrets.txt" } }]);
 });
 
-test("object approval decisions deny tools without executing and return the decision reason", async () => {
+test("object approval decisions deny tools without executing and return a safe denial reason", async () => {
   const fake = fakeLLM([response(null, [{ id: "declined", name: "guarded", arguments: "{}" }]), response("recovered")]);
   const events: AgentEvent[] = [];
   let executions = 0;
   const agent = new Agent({ llm: fake.llm, tools: [approvalTool("DESTRUCTIVE", async () => { executions += 1; return { content: "bad", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => ({ approved: false, reason: "not now" }), onEvent: (event) => events.push(event) });
   assert.equal((await agent.run("go")).answer, "recovered");
   assert.equal(executions, 0);
-  assert.deepEqual(fake.requests[1].at(-1), { role: "tool", toolCallId: "declined", content: "Tool error: User declined guarded: not now" });
+  assert.deepEqual(fake.requests[1].at(-1), { role: "tool", toolCallId: "declined", content: "Tool error: User declined guarded: approval denied" });
   assert.deepEqual(events.filter((event) => event.type === "tool_start" || event.type === "tool_end"), [
-    { type: "tool_end", turn: 1, toolCallId: "declined", toolName: "guarded", isError: true, message: "User declined guarded: not now" }
+    { type: "tool_end", turn: 1, toolCallId: "declined", toolName: "guarded", isError: true, message: "User declined guarded: approval denied" }
   ]);
+});
+
+test("unknown runtime permissions fail closed without asking or executing", async () => {
+  const fake = fakeLLM([response(null, [{ id: "bogus", name: "guarded", arguments: "{}" }]), response("recovered")]);
+  let approvals = 0;
+  let executions = 0;
+  const guarded = { ...approvalTool("SENSITIVE", async () => { executions += 1; return { content: "bad", isError: false }; }), permission: "BOGUS" as unknown as Tool["permission"] };
+  const agent = new Agent({ llm: fake.llm, tools: [guarded], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => { approvals += 1; return { approved: true, reason: "approved" }; } });
+  await agent.run("go");
+  assert.equal(approvals, 0);
+  assert.equal(executions, 0);
+  assert.deepEqual(fake.requests[1].at(-1), { role: "tool", toolCallId: "bogus", content: "Tool error: User declined guarded: approval failed" });
+});
+
+test("malformed approval decisions fail closed without executing", async () => {
+  const fake = fakeLLM([response(null, [{ id: "malformed", name: "guarded", arguments: "{}" }]), response("recovered")]);
+  let executions = 0;
+  const agent = new Agent({ llm: fake.llm, tools: [approvalTool("SENSITIVE", async () => { executions += 1; return { content: "bad", isError: false }; })], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => ({ approved: "yes" as unknown as boolean, reason: "secret reason" }) });
+  await agent.run("go");
+  assert.equal(executions, 0);
+  assert.deepEqual(fake.requests[1].at(-1), { role: "tool", toolCallId: "malformed", content: "Tool error: User declined guarded: approval failed" });
+});
+
+test("approval callback reasons never leak into model history or tool events", async () => {
+  const secret = "secret-approval-reason-".repeat(100);
+  const fake = fakeLLM([response(null, [{ id: "secret", name: "guarded", arguments: "{}" }]), response("recovered")]);
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ llm: fake.llm, tools: [approvalTool("SENSITIVE", async () => ({ content: "bad", isError: false }))], systemPrompt: "rules", rootDir: "/p", requestApproval: async () => ({ approved: false, reason: secret }), onEvent: (event) => events.push(event) });
+  await agent.run("go");
+  assert(!JSON.stringify(fake.requests).includes(secret));
+  assert(!JSON.stringify(events).includes(secret));
 });
 
 test("missing or failed approval callbacks fail closed without tool_start", async () => {
