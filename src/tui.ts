@@ -13,6 +13,102 @@ export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; 
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
+export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; renderMarkdown?: MarkdownRenderer };
+
+const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
+
+/** Removes terminal controls and invisible formatting from plain TUI fields. */
+export function sanitizePlainText(text: string): string {
+  return sanitizeMarkdown(text)
+    .replace(/[\p{Default_Ignorable_Code_Point}]/gu, "");
+}
+
+type Activity = { text: string; at: Date };
+
+/**
+ * An append-only transcript view. It deliberately does not repaint or stream
+ * model tokens: activity is collected and revealed only on explicit toggle.
+ */
+export class TuiView {
+  private readonly write: (text: string) => void;
+  private readonly now: () => Date;
+  private readonly markdown: MarkdownRenderer;
+  private activity: Activity[] = [];
+  private latestActivity: Activity[] = [];
+  private working = false;
+  private expanded = false;
+
+  constructor(runtime: TuiViewRuntime) {
+    this.write = runtime.write;
+    this.now = runtime.now ?? (() => new Date());
+    this.markdown = runtime.renderMarkdown ?? defaultMarkdownRenderer;
+  }
+
+  onEvent(event: AgentEvent): void {
+    if (event.type === "agent_start") {
+      this.latestActivity = [];
+      this.expanded = false;
+      this.writeLayer("user", `You: ${sanitizePlainText(event.prompt)}`);
+      if (!this.working) { this.writeLayer("activity", "Working..."); this.working = true; }
+      return;
+    }
+    if (event.type === "model_start" || event.type === "model_end" || event.type === "agent_end") {
+      if (event.type === "agent_end") {
+        this.working = false;
+        if (event.answer) this.renderAnswer(event.answer);
+        this.renderActivityState();
+      }
+      return;
+    }
+    if (event.type === "tool_start") {
+      this.addActivity(`→ ${sanitizePlainText(event.toolName)}`);
+      return;
+    }
+    if (event.type === "tool_end") {
+      const name = sanitizePlainText(event.toolName);
+      const summary = event.isError ? `: ${sanitizePlainText(event.message)}` : "";
+      this.addActivity(`${event.isError ? "✗" : "✓"} ${name}${summary}`);
+      return;
+    }
+    this.working = false;
+    this.writeLayer("error", sanitizePlainText(formatEvent(event)));
+  }
+
+  toggleLatestActivity(): boolean {
+    if (!this.latestActivity.length) return false;
+    this.expanded = !this.expanded;
+    this.renderActivityState();
+    return this.expanded;
+  }
+
+  clearActivity(): void {
+    this.activity = [];
+    this.latestActivity = [];
+    this.expanded = false;
+  }
+
+  private addActivity(text: string): void {
+    const item = { text, at: this.now() };
+    this.activity.push(item);
+    this.latestActivity.push(item);
+  }
+
+  private renderAnswer(answer: string): void {
+    try { this.writeLayer("assistant", `Assistant: ${renderMarkdown(answer, this.markdown)}`); }
+    catch { this.writeLayer("assistant", `Assistant: ${sanitizeMarkdown(answer)}`); }
+  }
+
+  private renderActivityState(): void {
+    if (!this.latestActivity.length) return;
+    const label = `Activity (${this.latestActivity.length}): ${this.expanded ? "expanded" : "collapsed"}`;
+    const details = this.expanded ? `\n${this.latestActivity.map((item) => item.text).join("\n")}` : "";
+    this.writeLayer("activity", `${label}${details}`);
+  }
+
+  private writeLayer(layer: "user" | "assistant" | "activity" | "error", text: string): void {
+    this.write(`${tuiColor[layer]}${text}${tuiColor.reset}\n`);
+  }
+}
 
 /** Removes terminal control input from untrusted model text while retaining layout. */
 export function sanitizeMarkdown(text: string): string {

@@ -21,7 +21,7 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
 
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
@@ -196,6 +196,50 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "tool_end", turn: 1, toolCallId: "x", toolName: "read_file", isError: false, message: "completed" }), "✓ read_file");
   assert.equal(formatEvent({ type: "error", stage: "model", message: "Model request failed" }), "Error: Model request failed");
   assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
+});
+
+test("TuiView groups agent events into colored final layers without raw thinking or tool results", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text), renderMarkdown: (text) => `md:${text}` });
+  view.onEvent({ type: "agent_start", prompt: "inspect src" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+  view.onEvent({ type: "tool_end", turn: 1, toolCallId: "a", toolName: "read_file", isError: false, message: "SECRET TOOL RESULT" });
+  view.onEvent({ type: "agent_end", answer: "# done", turns: 1 });
+  const text = output.join("");
+  assert.match(text, /\x1b\[38;5;110mYou: inspect src/);
+  assert.match(text, /\x1b\[38;5;141mAssistant: md:# done/);
+  assert.match(text, /\x1b\[38;5;245mActivity \(2\): collapsed/);
+  assert.equal((text.match(/Working\.\.\./g) ?? []).length, 1);
+  assert(!text.includes("Thinking") && !text.includes("SECRET TOOL RESULT"));
+});
+
+test("TuiView appends latest activity when toggled and clears it without affecting errors", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.onEvent({ type: "agent_start", prompt: "hello" });
+  view.onEvent({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+  view.onEvent({ type: "error", stage: "agent", message: "bad" });
+  assert.equal(view.toggleLatestActivity(), true);
+  assert.equal(view.toggleLatestActivity(), false);
+  view.clearActivity();
+  assert.equal(view.toggleLatestActivity(), false);
+  const text = output.join("");
+  assert.match(text, /Activity \(1\): expanded\n→ read_file/);
+  assert.match(text, /Activity \(1\): collapsed/);
+  assert.match(text, /\x1b\[38;5;203mError: bad/);
+});
+
+test("TuiView strips control and default-ignorable characters from all plain fields", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  const malicious = "ok\u0000\u009b31m\u001b]8;;bad\u0007\u200b\u2060";
+  view.onEvent({ type: "agent_start", prompt: malicious });
+  view.onEvent({ type: "tool_start", turn: 1, toolCallId: malicious, toolName: malicious });
+  view.onEvent({ type: "error", stage: "agent", message: malicious });
+  const text = output.join("").replace(/\x1b\[\d+(?:;\d+)*m/g, "");
+  assert(!/[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b\u2060]/u.test(text));
+  assert(!text.includes("\x1b]") && !text.includes("\x9b"));
 });
 
 test("renders Chinese model diagnostics and only exposes safe debug fields", () => {
