@@ -4,7 +4,7 @@
 
 Replace mini-Pi's streaming-style terminal prints with calm, low-contrast,
 Pi-inspired conversation blocks. A completed turn must make user input, final
-answer, runtime activity, approval, and errors visually distinct without
+answer, runtime activity, and errors visually distinct without
 revealing reasoning content or full tool outputs.
 
 ## Scope
@@ -17,7 +17,7 @@ revealing reasoning content or full tool outputs.
 - During a run, display only `· working · turn N`.
 - When the input is empty, Enter toggles the most recent completed Activity;
   empty Enter with no Activity is a no-op. Text plus Enter still sends a prompt.
-- Display low-contrast amber approval and red diagnostic/error blocks.
+- Display low-contrast red diagnostic/error blocks.
 - Preserve current commands, cancellation behaviour, root-dir boundaries, and
   safe Markdown/terminal-control handling.
 
@@ -37,7 +37,6 @@ revealing reasoning content or full tool outputs.
 | Assistant | muted purple left line and `MINI-PI · provider · N turns` label | safe rendered Markdown final answer |
 | Activity | quiet gray `▸ activity · N tools · duration` line | collapsed by default; event summaries when expanded |
 | Working | one quiet `· working · turn N` line | replaces live event spam while a run is active |
-| Approval | muted amber left line | existing safe approval request and exact confirmation instruction |
 | Error | muted red left line | existing safe diagnostic's level, reason, and advice |
 | Input | subdued top separator and `›` prompt | command or user text |
 
@@ -92,13 +91,11 @@ to every Agent constructed for the session, including replacement Agents after
   event summary at most.
 - The TUI view model stays session-memory only and is cleared by `/reset`.
 
-## Error and approval behaviour
+## Error behaviour
 
-Approval remains interactive and exact: SENSITIVE needs `y`, DESTRUCTIVE needs
-`yes`. It is rendered through the amber layer, then its decision is still made
-by the Agent runtime. A provider/agent failure renders the existing safe Chinese
-diagnostic in a red layer; it does not turn into Markdown and does not erase the
-latest Activity.
+A provider/agent failure renders the existing safe Chinese diagnostic in a red
+layer after its activity has finalized; it does not turn into Markdown and does
+not erase the latest Activity.
 
 ## Test matrix
 
@@ -113,7 +110,7 @@ latest Activity.
 - Error after tool activity shows red safe error text and permits Activity toggle.
 - Layer renderers strip terminal controls/default-ignorable Unicode from all
   untrusted fields; Markdown fallback remains safe.
-- Existing EOF, SIGINT, approval, and command tests remain green.
+- Existing EOF, SIGINT, and command tests remain green.
 
 ## Deferred follow-up
 

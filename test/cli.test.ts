@@ -21,7 +21,7 @@ import {
   type CredentialStore,
   validateOptions
 } from "../src/cli.js";
-import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
+import { formatEvent, helpText, parseCommand, renderMarkdown, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
 
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
@@ -53,22 +53,6 @@ test("removes controls decoded from Markdown entities and disables terminal hype
 
 test("does not turn model-controlled private-use characters into terminal styles", () => {
   assert.equal(renderMarkdown("\uE00031\uE001", (text) => text), "\uE00031\uE001");
-});
-
-test("terminal approval uses the amber layer, sanitizes details, and keeps exact confirmation", async () => {
-  const output: string[] = [];
-  let closed = false;
-  const result = await requestTerminalApproval({
-    toolName: "guard\u001b[2Jed", permission: "SENSITIVE", reason: "need\u200b permission", risk: "low", arguments: { path: "a\u001b]8;;bad\u0007" }
-  }, {
-    createLine: () => ({ question: async () => "yes", close: () => { closed = true; } }),
-    write: (text) => output.push(text)
-  });
-  assert.deepEqual(result, { approved: false, reason: "user declined" });
-  assert.equal(closed, true);
-  const text = output.join("");
-  assert.match(text, /\x1b\[38;5;179mTool: guarded/);
-  assert(!text.includes("\u001b]8;") && !text.includes("\u001b[2J") && !text.includes("\u200b"));
 });
 
 test("TUI renders only final answers and falls back to safe plain text", async () => {
@@ -139,22 +123,31 @@ test("layered TUI integration toggles completed activity, resets it, and still s
   assert.equal((text.match(/Enter a question/g) ?? []).length, 0);
 });
 
-test("layered TUI integration keeps its event sink when login or model replaces an agent", async () => {
+test("layered TUI uses the replacement session provider and model for actual runs", async () => {
   const output: string[] = [];
-  const inputs = ["/login", "/model", "/exit"];
+  const inputs = ["/login", "after-login", "/model", "after-model", "/exit"];
   const view = new TuiView({ write: (text) => output.push(text), provider: "openai" });
-  const original = { reset() {} } as never;
-  const replacements: unknown[] = [];
-  const replacement = { reset() {} } as never;
+  const agent = (answer: string) => ({ reset() {}, async run(prompt: string) {
+    sink({ type: "agent_start", prompt });
+    sink({ type: "model_start", turn: 1 });
+    sink({ type: "agent_end", answer, turns: 1 });
+    return { answer, messages: [], turns: 1 };
+  } }) as never;
+  const original = agent("original");
+  const loggedIn = agent("login-answer");
+  const modelChanged = agent("model-answer");
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = view.onEvent.bind(view);
   await startTui(original, { project: "/project", provider: "openai", model: "old" }, {
-    login: async (session) => { replacements.push(session.agent); return { ...session, agent: replacement }; },
-    model: async (session) => { replacements.push(session.agent); return { ...session, agent: replacement, model: "new" }; },
+    login: async (session) => ({ ...session, agent: loggedIn, provider: "deepseek", model: "chat" }),
+    model: async (session) => ({ ...session, agent: modelChanged, model: "reasoner" }),
     logout: async () => undefined
   }, {
     createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
     write: (text) => output.push(text)
   }, view);
-  assert.deepEqual(replacements, [original, replacement]);
+  const text = output.join("");
+  assert.match(text, /MINI-PI · deepseek · chat · 1 turns\nlogin-answer/);
+  assert.match(text, /MINI-PI · deepseek · reasoner · 1 turns\nmodel-answer/);
 });
 
 test("interactive command releases its prompt and returns to the next prompt", async () => {
@@ -301,6 +294,7 @@ test("TuiView appends safe tool summaries when toggled and retains them after er
   view.onEvent({ type: "agent_start", prompt: "hello" });
   view.onEvent({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
   view.onEvent({ type: "error", stage: "agent", message: "bad" });
+  view.onEvent({ type: "agent_end", answer: "", turns: 1 });
   assert.equal(view.toggleLatestActivity(), true);
   assert.equal(view.toggleLatestActivity(), false);
   view.clearActivity();
@@ -309,6 +303,34 @@ test("TuiView appends safe tool summaries when toggled and retains them after er
   assert.match(text, /▾ activity · 1 tools · \d+ms\n→ read_file/);
   assert.match(text, /▸ activity · 1 tools · \d+ms/);
   assert.match(text, /\x1b\[38;5;203mError: bad/);
+});
+
+test("TuiView defers a failure until agent_end finalizes activity and startTui does not duplicate it", async () => {
+  const output: string[] = [];
+  const inputs = ["question", "/exit"];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = view.onEvent.bind(view);
+  const agent = { reset() {}, async run(prompt: string) {
+    sink({ type: "agent_start", prompt });
+    sink({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
+    sink({ type: "error", stage: "agent", message: "broken" });
+    sink({ type: "agent_end", answer: "", turns: 1 });
+    throw new Error("broken");
+  } } as never;
+  await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => output.push(text)
+  }, view);
+  const text = output.join("");
+  assert(text.indexOf("▸ activity · 1 tools") < text.indexOf("Error: broken"));
+  assert.equal((text.match(/Error: broken/g) ?? []).length, 1);
+});
+
+test("TuiView forwards MINI_PI_DEBUG to diagnostic formatting", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text), debug: true });
+  view.onEvent({ type: "error", stage: "model", turn: 1, message: "limited", diagnostic: { level: "warning", kind: "rate_limit", provider: "openai", message: "limited", reason: "slow down", advice: "retry", status: 429 } });
+  assert.match(output.join(""), /调试：HTTP 429/);
 });
 
 test("TuiView keeps multiple activity records with their own turn counts", () => {
