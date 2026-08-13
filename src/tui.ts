@@ -13,7 +13,7 @@ export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; 
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
-export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; renderMarkdown?: MarkdownRenderer };
+export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; provider?: ProviderName; renderMarkdown?: MarkdownRenderer };
 
 const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
 
@@ -23,7 +23,9 @@ export function sanitizePlainText(text: string): string {
     .replace(/[\p{Default_Ignorable_Code_Point}]/gu, "");
 }
 
-type Activity = { text: string; at: Date };
+export type ActivityItem = { text: string; isError: boolean };
+export type Activity = { turnCount: number; toolCount: number; durationMs: number; items: ActivityItem[]; expanded: boolean };
+type ActiveActivity = Activity & { startedAt: Date };
 
 /**
  * An append-only transcript view. It deliberately does not repaint or stream
@@ -33,75 +35,86 @@ export class TuiView {
   private readonly write: (text: string) => void;
   private readonly now: () => Date;
   private readonly markdown: MarkdownRenderer;
+  private readonly provider: ProviderName;
   private activity: Activity[] = [];
-  private latestActivity: Activity[] = [];
-  private working = false;
-  private expanded = false;
+  private currentActivity: ActiveActivity | undefined;
 
   constructor(runtime: TuiViewRuntime) {
     this.write = runtime.write;
     this.now = runtime.now ?? (() => new Date());
+    this.provider = runtime.provider ?? "openai";
     this.markdown = runtime.renderMarkdown ?? defaultMarkdownRenderer;
   }
 
   onEvent(event: AgentEvent): void {
     if (event.type === "agent_start") {
-      this.latestActivity = [];
-      this.expanded = false;
-      this.writeLayer("user", `You: ${sanitizePlainText(event.prompt)}`);
-      if (!this.working) { this.writeLayer("activity", "Working..."); this.working = true; }
+      this.currentActivity = { turnCount: 0, toolCount: 0, durationMs: 0, items: [], expanded: false, startedAt: this.now() };
+      this.writeLayer("user", `YOU: ${sanitizePlainText(event.prompt)}`);
       return;
     }
-    if (event.type === "model_start" || event.type === "model_end" || event.type === "agent_end") {
+    if (event.type === "model_start") {
+      if (this.currentActivity) this.currentActivity.turnCount = event.turn;
+      this.writeLayer("activity", `· working · turn ${event.turn}`);
+      return;
+    }
+    if (event.type === "model_end" || event.type === "agent_end") {
       if (event.type === "agent_end") {
-        this.working = false;
-        if (event.answer) this.renderAnswer(event.answer);
-        this.renderActivityState();
+        if (this.currentActivity) this.currentActivity.turnCount = event.turns;
+        if (event.answer) this.renderAnswer(event.answer, event.turns);
+        this.finishActivity();
       }
       return;
     }
     if (event.type === "tool_start") {
-      this.addActivity(`→ ${sanitizePlainText(event.toolName)}`);
+      this.addActivity(`→ ${sanitizePlainText(event.toolName)}`, false, true);
       return;
     }
     if (event.type === "tool_end") {
       const name = sanitizePlainText(event.toolName);
       const summary = event.isError ? `: ${sanitizePlainText(event.message)}` : "";
-      this.addActivity(`${event.isError ? "✗" : "✓"} ${name}${summary}`);
+      this.addActivity(`${event.isError ? "✗" : "✓"} ${name}${summary}`, event.isError);
       return;
     }
-    this.working = false;
     this.writeLayer("error", sanitizePlainText(formatEvent(event)));
   }
 
   toggleLatestActivity(): boolean {
-    if (!this.latestActivity.length) return false;
-    this.expanded = !this.expanded;
-    this.renderActivityState();
-    return this.expanded;
+    const latest = this.activity.at(-1) ?? this.currentActivity;
+    if (!latest) return false;
+    latest.expanded = !latest.expanded;
+    this.renderActivityState(latest);
+    return latest.expanded;
   }
 
   clearActivity(): void {
     this.activity = [];
-    this.latestActivity = [];
-    this.expanded = false;
+    this.currentActivity = undefined;
   }
 
-  private addActivity(text: string): void {
-    const item = { text, at: this.now() };
-    this.activity.push(item);
-    this.latestActivity.push(item);
+  private addActivity(text: string, isError: boolean, isToolStart = false): void {
+    if (!this.currentActivity) return;
+    this.currentActivity.items.push({ text, isError });
+    if (isToolStart) this.currentActivity.toolCount += 1;
   }
 
-  private renderAnswer(answer: string): void {
-    try { this.writeLayer("assistant", `Assistant: ${renderMarkdown(answer, this.markdown)}`); }
-    catch { this.writeLayer("assistant", `Assistant: ${sanitizeMarkdown(answer)}`); }
+  private renderAnswer(answer: string, turns: number): void {
+    const label = `MINI-PI · ${this.provider} · ${turns} turns`;
+    try { this.writeLayer("assistant", `${label}\n${renderMarkdown(answer, this.markdown)}`); }
+    catch { this.writeLayer("assistant", `${label}\n${sanitizeMarkdown(answer)}`); }
   }
 
-  private renderActivityState(): void {
-    if (!this.latestActivity.length) return;
-    const label = `Activity (${this.latestActivity.length}): ${this.expanded ? "expanded" : "collapsed"}`;
-    const details = this.expanded ? `\n${this.latestActivity.map((item) => item.text).join("\n")}` : "";
+  private finishActivity(): void {
+    if (!this.currentActivity) return;
+    this.currentActivity.durationMs = Math.max(0, this.now().getTime() - this.currentActivity.startedAt.getTime());
+    const { startedAt: _startedAt, ...activity } = this.currentActivity;
+    this.activity.push(activity);
+    this.currentActivity = undefined;
+    this.renderActivityState(activity);
+  }
+
+  private renderActivityState(activity: Activity): void {
+    const label = `${activity.expanded ? "▾" : "▸"} activity · ${activity.toolCount} tools · ${activity.durationMs}ms`;
+    const details = activity.expanded ? `\n${activity.items.map((item) => item.text).join("\n")}` : "";
     this.writeLayer("activity", `${label}${details}`);
   }
 
@@ -128,7 +141,8 @@ export function sanitizeRenderedMarkdown(text: string): string {
     .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
+    .replace(/[\p{Default_Ignorable_Code_Point}]/gu, "");
   const sgr = /\x1b\[(\d{0,3}(?:[;:]\d{0,3})*)m/g;
   let safeText = "", cursor = 0;
   for (const style of text.matchAll(sgr)) {

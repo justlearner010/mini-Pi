@@ -198,23 +198,37 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
 });
 
-test("TuiView groups agent events into colored final layers without raw thinking or tool results", () => {
+test("TuiView records one collapsed activity with labels, counts, and duration", () => {
   const output: string[] = [];
-  const view = new TuiView({ write: (text) => output.push(text), renderMarkdown: (text) => `md:${text}` });
+  const times = [new Date(1000), new Date(1250)];
+  const view = new TuiView({ write: (text) => output.push(text), now: () => times.shift()!, provider: "openai", renderMarkdown: (text) => `md:${text}` });
   view.onEvent({ type: "agent_start", prompt: "inspect src" });
   view.onEvent({ type: "model_start", turn: 1 });
   view.onEvent({ type: "tool_start", turn: 1, toolCallId: "a", toolName: "read_file" });
   view.onEvent({ type: "tool_end", turn: 1, toolCallId: "a", toolName: "read_file", isError: false, message: "SECRET TOOL RESULT" });
   view.onEvent({ type: "agent_end", answer: "# done", turns: 1 });
   const text = output.join("");
-  assert.match(text, /\x1b\[38;5;110mYou: inspect src/);
-  assert.match(text, /\x1b\[38;5;141mAssistant: md:# done/);
-  assert.match(text, /\x1b\[38;5;245mActivity \(2\): collapsed/);
-  assert.equal((text.match(/Working\.\.\./g) ?? []).length, 1);
-  assert(!text.includes("Thinking") && !text.includes("SECRET TOOL RESULT"));
+  assert.match(text, /\x1b\[38;5;110mYOU: inspect src/);
+  assert.match(text, /\x1b\[38;5;141mMINI-PI · openai · 1 turns\nmd:# done/);
+  assert.match(text, /\x1b\[38;5;245m▸ activity · 1 tools · 250ms/);
+  assert.match(text, /· working · turn 1/);
+  assert(!text.includes("Working...") && !text.includes("Thinking") && !text.includes("SECRET TOOL RESULT"));
 });
 
-test("TuiView appends latest activity when toggled and clears it without affecting errors", () => {
+test("TuiView creates and toggles a collapsed activity for a zero-tool run", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.onEvent({ type: "agent_start", prompt: "hello" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "agent_end", answer: "done", turns: 1 });
+  assert.equal(view.toggleLatestActivity(), true);
+  assert.equal(view.toggleLatestActivity(), false);
+  const text = output.join("");
+  assert.match(text, /▸ activity · 0 tools · \d+ms/);
+  assert.match(text, /▾ activity · 0 tools · \d+ms/);
+});
+
+test("TuiView appends safe tool summaries when toggled and retains them after errors", () => {
   const output: string[] = [];
   const view = new TuiView({ write: (text) => output.push(text) });
   view.onEvent({ type: "agent_start", prompt: "hello" });
@@ -225,9 +239,28 @@ test("TuiView appends latest activity when toggled and clears it without affecti
   view.clearActivity();
   assert.equal(view.toggleLatestActivity(), false);
   const text = output.join("");
-  assert.match(text, /Activity \(1\): expanded\n→ read_file/);
-  assert.match(text, /Activity \(1\): collapsed/);
+  assert.match(text, /▾ activity · 1 tools · \d+ms\n→ read_file/);
+  assert.match(text, /▸ activity · 1 tools · \d+ms/);
   assert.match(text, /\x1b\[38;5;203mError: bad/);
+});
+
+test("TuiView keeps multiple activity records with their own turn counts", () => {
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.onEvent({ type: "agent_start", prompt: "one" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "agent_end", answer: "one", turns: 1 });
+  view.onEvent({ type: "agent_start", prompt: "two" });
+  view.onEvent({ type: "model_start", turn: 1 });
+  view.onEvent({ type: "model_start", turn: 2 });
+  view.onEvent({ type: "tool_start", turn: 2, toolCallId: "b", toolName: "scan_project" });
+  view.onEvent({ type: "tool_end", turn: 2, toolCallId: "b", toolName: "scan_project", isError: false, message: "completed" });
+  view.onEvent({ type: "agent_end", answer: "two", turns: 2 });
+  const text = output.join("");
+  assert.match(text, /MINI-PI · openai · 1 turns/);
+  assert.match(text, /MINI-PI · openai · 2 turns/);
+  assert.equal((text.match(/▸ activity/g) ?? []).length, 2);
+  assert.match(text, /▸ activity · 1 tools · \d+ms/);
 });
 
 test("TuiView strips control and default-ignorable characters from all plain fields", () => {
@@ -240,6 +273,11 @@ test("TuiView strips control and default-ignorable characters from all plain fie
   const text = output.join("").replace(/\x1b\[\d+(?:;\d+)*m/g, "");
   assert(!/[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b\u2060]/u.test(text));
   assert(!text.includes("\x1b]") && !text.includes("\x9b"));
+});
+
+test("Markdown output strips default-ignorable characters while retaining trusted SGR", () => {
+  const rendered = renderMarkdown("a\u200b\u2060b", () => "\x1b[35ma\u200b\u2060b\x1b[0m");
+  assert.equal(rendered, "\x1b[35mab\x1b[0m");
 });
 
 test("renders Chinese model diagnostics and only exposes safe debug fields", () => {
