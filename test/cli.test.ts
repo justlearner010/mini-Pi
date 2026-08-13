@@ -65,6 +65,25 @@ test("terminal approval rejects input failures and unavailable arguments safely"
   assert.match(outputs.join(""), /\[unavailable\]/);
 });
 
+test("terminal approval strips terminal controls and bidi characters from untrusted request text", async () => {
+  const output: string[] = [];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => "no", close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await requestTerminalApproval({
+    toolName: "guarded\u001b]0;spoof\u0007\u009b2J\u202ereversed",
+    permission: "SENSITIVE",
+    reason: "reason\u001b[2J\u200bhidden",
+    risk: "risk\u009d8;;bad\u009c\u2066isolated",
+    arguments: { path: "safe\u001b[31mtext\u001b[0m\u202e.txt" }
+  }, runtime);
+  const rendered = output.join("");
+  assert(!/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/.test(rendered));
+  assert.match(rendered, /Tool: guardedreversed/);
+  assert.match(rendered, /"path": "safetext.txt"/);
+});
+
 test("renders common Markdown answer text without leaving formatting markers", () => {
   const rendered = renderMarkdown("# Heading\n\n**bold** and *italic* and `code`\n\n- item\n\n```ts\nconst value = 1;\n```\n\n[link](https://example.com)\n\n| name | value |\n| --- | --- |\n| row | cell |");
   for (const text of ["Heading", "bold", "italic", "code", "item", "const value = 1;", "link", "row", "cell"]) assert.match(rendered, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

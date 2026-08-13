@@ -14,8 +14,25 @@ export type TuiLine = { question: (prompt: string) => Promise<string>; close: ()
 export type MarkdownRenderer = (text: string) => string;
 export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
 
+const MAX_APPROVAL_FIELD_LENGTH = 500;
+const MAX_APPROVAL_ARGUMENTS_LENGTH = 4_000;
+
+/** Makes untrusted approval details safe for a terminal while retaining structural JSON newlines. */
+function sanitizeApprovalDisplay(text: string, maximumLength: number, preserveNewlines = false): string {
+  const withoutTerminalSequences = text
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
+    .replace(/\x9d[\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g, "")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "");
+  const controls = preserveNewlines ? /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g : /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
+  const safe = withoutTerminalSequences.replace(controls, "");
+  return safe.length > maximumLength ? `${safe.slice(0, maximumLength)}… [truncated]` : safe;
+}
+
 function approvalArguments(argumentsValue: unknown): string {
-  try { return JSON.stringify(argumentsValue, null, 2) ?? "[unavailable]"; }
+  try {
+    const serialized = JSON.stringify(argumentsValue, (_key, value) => typeof value === "string" ? sanitizeApprovalDisplay(value, MAX_APPROVAL_FIELD_LENGTH) : value, 2);
+    return sanitizeApprovalDisplay(serialized ?? "[unavailable]", MAX_APPROVAL_ARGUMENTS_LENGTH, true);
+  }
   catch { return "[unavailable]"; }
 }
 
@@ -25,7 +42,7 @@ export async function requestTerminalApproval(request: ApprovalRequest, runtime:
   const write = runtime.write ?? ((text: string) => { stdout.write(text); });
   const destructive = request.permission === "DESTRUCTIVE";
   const required = destructive ? "yes" : "y";
-  write(`\nTool: ${request.toolName}\nReason: ${request.reason}\nRisk: ${request.risk}\nArguments:\n${approvalArguments(request.arguments)}\n`);
+  write(`\nTool: ${sanitizeApprovalDisplay(request.toolName, MAX_APPROVAL_FIELD_LENGTH)}\nReason: ${sanitizeApprovalDisplay(request.reason, MAX_APPROVAL_FIELD_LENGTH)}\nRisk: ${sanitizeApprovalDisplay(request.risk, MAX_APPROVAL_FIELD_LENGTH)}\nArguments:\n${approvalArguments(request.arguments)}\n`);
   if (destructive) write("HIGH RISK: This action may be irreversible.\n");
   const line = createLine();
   try {
