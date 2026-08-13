@@ -3,8 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "bin": { "mini-pi": "./dist/src/cli.js" },
-  "engines": { "node": ">=22" },
+  "bin": {
+    "mini-pi": "./dist/src/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
@@ -14,7 +18,10 @@
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
+    "@github/keytar": "7.10.6",
+    "@inquirer/password": "5.1.1",
     "@inquirer/select": "5.2.1",
+    "markdansi": "0.3.2",
     "openai": "7.4.0",
     "typescript": "5.9.3"
   },

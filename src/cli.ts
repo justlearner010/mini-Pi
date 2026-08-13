@@ -1,16 +1,132 @@
 #!/usr/bin/env node
 import { parseArgs as nodeParseArgs } from "node:util";
-import { realpath, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
-import { Agent, type AgentEvent } from "./agent.js";
+import { Agent, type AgentEvent, type RequestApproval } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
 import { tools } from "./tool.js";
-import { chooseModel, chooseProvider, formatEvent, startTui } from "./tui.js";
+import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
 export type ValidatedOptions = CliOptions & { rootDir?: string; apiKey?: string; error?: string };
 export type InteractiveDeps = { chooseProvider: () => Promise<ProviderName>; chooseModel: (models: string[]) => Promise<string>; listModels: (provider: ProviderName, key: string) => Promise<string[]> };
+export type OnboardingDeps = InteractiveDeps & { credentials: CredentialStore; askApiKey: () => Promise<string>; savePreference: (preference: GlobalPreference) => Promise<void> };
+export interface CredentialStore {
+  getPassword(service: string, account: string): Promise<string | null>;
+  setPassword(service: string, account: string, password: string): Promise<void>;
+  deletePassword(service: string, account: string): Promise<boolean>;
+}
+export type GlobalPreference = { provider: ProviderName; model: string };
+export type KeySource = "environment" | "credential-store";
+export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
+export const CREDENTIAL_SERVICE = "mini-Pi";
+export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
+const require = createRequire(import.meta.url);
+
+export function createSystemCredentialStore(load: () => CredentialStore = () => require("@github/keytar") as CredentialStore): CredentialStore {
+  let store: CredentialStore | undefined;
+  const getStore = (): CredentialStore => store ??= load();
+  return {
+    getPassword: (service, account) => getStore().getPassword(service, account),
+    setPassword: (service, account, password) => getStore().setPassword(service, account, password),
+    deletePassword: (service, account) => getStore().deletePassword(service, account)
+  };
+}
+export const systemCredentials = createSystemCredentialStore();
+
+function environmentName(provider: ProviderName): "OPENAI_API_KEY" | "DEEPSEEK_API_KEY" {
+  return provider === "openai" ? "OPENAI_API_KEY" : "DEEPSEEK_API_KEY";
+}
+
+export function defaultConfigPath(home = homedir()): string {
+  return join(home, ".mini-pi", "config.json");
+}
+
+function isPreference(value: unknown): value is GlobalPreference {
+  const item = value as { provider?: unknown; model?: unknown };
+  return typeof value === "object" && value !== null && Object.keys(value).length === 2 && Object.keys(value).every((key) => key === "provider" || key === "model")
+    && (item.provider === "openai" || item.provider === "deepseek") && typeof item.model === "string" && item.model.length > 0;
+}
+
+function hasPreferenceFields(value: unknown): value is GlobalPreference {
+  const item = value as { provider?: unknown; model?: unknown };
+  return typeof value === "object" && value !== null && (item.provider === "openai" || item.provider === "deepseek")
+    && typeof item.model === "string" && item.model.length > 0;
+}
+
+export async function readGlobalPreference(configPath = defaultConfigPath()): Promise<GlobalPreference | undefined> {
+  try {
+    const value: unknown = JSON.parse(await readFile(configPath, "utf8"));
+    return isPreference(value) ? value : undefined;
+  } catch { return undefined; }
+}
+
+export async function saveGlobalPreference(preference: GlobalPreference, configPath = defaultConfigPath()): Promise<void> {
+  if (!hasPreferenceFields(preference)) throw new Error("Invalid global preference");
+  const directory = dirname(configPath);
+  const temporary = `${configPath}.${randomUUID()}.tmp`;
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(temporary, `${JSON.stringify({ provider: preference.provider, model: preference.model })}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, configPath);
+  } catch {
+    throw new Error("Unable to save global preference");
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+export async function clearGlobalPreference(configPath = defaultConfigPath()): Promise<void> { try { await unlink(configPath); } catch (error) { if ((error as { code?: string }).code !== "ENOENT") throw error; } }
+
+export async function resolveApiKey(provider: ProviderName, credentials: CredentialStore, env: NodeJS.ProcessEnv = process.env): Promise<{ apiKey: string; source: KeySource } | undefined> {
+  const environmentKey = env[environmentName(provider)];
+  if (environmentKey) return { apiKey: environmentKey, source: "environment" };
+  try {
+    const apiKey = await credentials.getPassword(CREDENTIAL_SERVICE, provider);
+    return apiKey ? { apiKey, source: "credential-store" } : undefined;
+  } catch { return undefined; }
+}
+
+export async function getStartupSelection(credentials: CredentialStore = systemCredentials, configPath = defaultConfigPath(), env: NodeJS.ProcessEnv = process.env): Promise<StartupSelection | undefined> {
+  const preference = await readGlobalPreference(configPath);
+  if (!preference) return undefined;
+  const key = await resolveApiKey(preference.provider, credentials, env);
+  return key && { ...preference, apiKey: key.apiKey, keySource: key.source };
+}
+
+export async function loginWithCredentialStore(deps: OnboardingDeps): Promise<StartupSelection> {
+  const provider = await deps.chooseProvider();
+  const apiKey = await deps.askApiKey();
+  if (!apiKey) throw new Error("API key cannot be empty");
+  const models = await deps.listModels(provider, apiKey);
+  if (!models.length) throw new Error("No models are available for this provider");
+  const model = await deps.chooseModel(models);
+  const oldKey = await deps.credentials.getPassword(CREDENTIAL_SERVICE, provider);
+  await deps.credentials.setPassword(CREDENTIAL_SERVICE, provider, apiKey);
+  try { await deps.savePreference({ provider, model }); }
+  catch (error) { oldKey ? await deps.credentials.setPassword(CREDENTIAL_SERVICE, provider, oldKey) : await deps.credentials.deletePassword(CREDENTIAL_SERVICE, provider); throw error; }
+  return { provider, model, apiKey, keySource: "credential-store" };
+}
+
+export async function selectAndSaveModel(preference: GlobalPreference, apiKey: string, deps: Pick<OnboardingDeps, "listModels" | "chooseModel" | "savePreference">): Promise<GlobalPreference> {
+  const models = await deps.listModels(preference.provider, apiKey);
+  if (!models.length) throw new Error("No models are available for this provider");
+  const next = { provider: preference.provider, model: await deps.chooseModel(models) };
+  await deps.savePreference(next);
+  return next;
+}
+
+export async function logoutFromCredentialStore(credentials: CredentialStore, preference: GlobalPreference | undefined, choose: (providers: ProviderName[]) => Promise<ProviderName>, clearPreference: () => Promise<void>): Promise<ProviderName | undefined> {
+  const providers = (await Promise.all((['openai', 'deepseek'] as ProviderName[]).map(async (provider) => (await credentials.getPassword(CREDENTIAL_SERVICE, provider)) ? provider : undefined))).filter((value): value is ProviderName => Boolean(value));
+  if (!providers.length) return undefined;
+  const provider = await choose(providers);
+  await credentials.deletePassword(CREDENTIAL_SERVICE, provider);
+  if (preference?.provider === provider) await clearPreference();
+  return provider;
+}
 
 export function exitCodeFor(error: unknown): number {
   const failure = error as { name?: string; code?: string };
@@ -26,7 +142,7 @@ export function parseArgs(args: string[]): CliOptions {
   return { project: positionals[0] ?? ".", provider: values.provider as ProviderName | undefined, model: values.model, prompt: values.prompt, help: values.help ?? false, version: values.version ?? false };
 }
 
-export async function validateOptions(options: CliOptions, env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): Promise<ValidatedOptions> {
+export async function validateOptions(options: CliOptions, env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), credentials?: CredentialStore): Promise<ValidatedOptions> {
   let rootDir: string;
   try {
     rootDir = await realpath(resolve(cwd, options.project));
@@ -35,10 +151,9 @@ export async function validateOptions(options: CliOptions, env: NodeJS.ProcessEn
   catch { return { ...options, error: `Project directory not found: ${options.project}` }; }
   if (options.prompt && (!options.provider || !options.model)) return { ...options, rootDir, error: "--prompt requires both --provider and --model" };
   if (options.provider) {
-    const name = options.provider === "openai" ? "OPENAI_API_KEY" : "DEEPSEEK_API_KEY";
-    const apiKey = env[name];
-    if (!apiKey) return { ...options, rootDir, error: `Missing ${name} in environment` };
-    return { ...options, rootDir, apiKey };
+    const key = credentials ? await resolveApiKey(options.provider, credentials, env) : env[environmentName(options.provider)] ? { apiKey: env[environmentName(options.provider)]!, source: "environment" as const } : undefined;
+    if (!key) return { ...options, rootDir, error: `No saved API key for ${options.provider}; run mini-pi without options to log in` };
+    return { ...options, rootDir, apiKey: key.apiKey };
   }
   return { ...options, rootDir };
 }
@@ -78,14 +193,14 @@ For full-project analysis, include:
 - important entry points;
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
-function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: OPENAI_API_KEY or DEEPSEEK_API_KEY (environment only)."; }
-function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, onEvent: (event: AgentEvent) => void): Agent {
-  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent });
+function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
+function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
+  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
 }
 
-export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env): Promise<ValidatedOptions> {
+export async function completeInteractiveOptions(valid: ValidatedOptions, deps: InteractiveDeps = { chooseProvider, chooseModel, listModels }, env: NodeJS.ProcessEnv = process.env, credentials?: CredentialStore): Promise<ValidatedOptions> {
   const provider = valid.provider ?? await deps.chooseProvider();
-  const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, env, valid.rootDir);
+  const refreshed = provider === valid.provider ? valid : await validateOptions({ ...valid, provider }, env, valid.rootDir, credentials);
   if (refreshed.error || refreshed.model) return refreshed;
   try {
     const models = await deps.listModels(provider, refreshed.apiKey!);
@@ -102,15 +217,24 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   try { options = parseArgs(args); } catch (error) { console.error(error instanceof Error ? error.message : "Invalid arguments"); return 1; }
   if (options.help) { console.log(usage()); return 0; }
   if (options.version) { console.log("mini-pi 0.1.0"); return 0; }
-  let valid = await validateOptions(options, env, cwd);
+  let valid = await validateOptions(options, env, cwd, systemCredentials);
   if (valid.error) { console.error(valid.error); return 1; }
   try {
-    if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env);
-  } catch (error) { return exitCodeFor(error); }
+    if (!valid.provider && !valid.model && !valid.prompt) {
+      const saved = await getStartupSelection(systemCredentials, defaultConfigPath(), env);
+      valid = saved ? { ...valid, ...saved } : { ...valid, ...(await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference })) };
+    } else if (!valid.provider || !valid.model) valid = await completeInteractiveOptions(valid, { chooseProvider, chooseModel, listModels }, env, systemCredentials);
+  } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
-  const agent = makeAgent(valid as Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, (event) => { const text = formatEvent(event); if (text) console.log(text); });
-  if (valid.prompt) { try { console.log((await agent.run(valid.prompt)).answer); return 0; } catch { return 1; } }
-  return startTui(agent, { project: valid.rootDir!, provider: valid.provider!, model: valid.model! });
+  const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, (event) => { const text = formatEvent(event, debugEnabled(env)); if (text) console.log(text); }, requestApproval, history) });
+  const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
+  if (valid.prompt) { try { console.log((await session.agent.run(valid.prompt)).answer); return 0; } catch { return 1; } }
+  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {
+    login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
+    model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.agent.history()); },
+    logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference)
+  });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) run().then((code) => { process.exitCode = code; });
