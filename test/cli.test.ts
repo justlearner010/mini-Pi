@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  buildProjectMap,
   completeInteractiveOptions,
   createSystemCredentialStore,
   debugEnabled,
@@ -32,6 +33,104 @@ test("one-shot prompt uses the plain CLI transcript and prints its answer once",
   const text = output.join("");
   assert(!text.includes("YOU:") && !text.includes("MINI-PI") && !text.includes("activity"));
   assert.equal((text.match(/final answer/g) ?? []).length, 1);
+});
+
+test("buildProjectMap renders a stable language-aware project overview", () => {
+  const map = buildProjectMap({
+    scannedPath: ".",
+    readmePath: "README.md",
+    manifestPaths: ["package.json", "tsconfig.json"],
+    sourceFiles: ["src/index.ts", "src/server.ts", "scripts/build.py"],
+    unsupportedFiles: ["assets/logo.svg"],
+    tree: "",
+    totalRelevantFiles: 6,
+    returnedFileCount: 6,
+    truncated: false
+  });
+
+  assert.deepEqual(map, {
+    status: "loaded",
+    totalFiles: 6,
+    entryCandidates: 2,
+    context: [
+      "Project map (6 relevant files)",
+      "README: README.md",
+      "Manifests: package.json, tsconfig.json",
+      "Source files: 3; unsupported files: 1",
+      "TS/JS source files: 2",
+      "Candidate TS/JS entry points: src/index.ts, src/server.ts",
+      "Directories: scripts (1), src (2)",
+      "Languages: Python (1), TypeScript (2)",
+      "Candidate areas: scripts (1), src (2)"
+    ].join("\n")
+  });
+});
+
+test("buildProjectMap retains the scan warning and omission marker within its character cap", () => {
+  const sourceFiles = Array.from({ length: 500 }, (_, index) => `packages/package-${String(index).padStart(3, "0")}/src/${"very-long-module-name-".repeat(4)}${index}.ts`);
+  const map = buildProjectMap({
+    scannedPath: ".",
+    readmePath: null,
+    manifestPaths: [],
+    sourceFiles,
+    unsupportedFiles: [],
+    tree: "",
+    totalRelevantFiles: 600,
+    returnedFileCount: 500,
+    truncated: true
+  });
+
+  assert.equal(map.status, "loaded");
+  if (map.status !== "loaded") return;
+  assert(map.context.length <= 4_000);
+  assert.match(map.context, /Scan truncated: 500 of 600 relevant files returned/);
+  assert(map.context.includes("Omitted map details due to 4000-character limit"));
+  assert(map.context.endsWith("\n") === false);
+  for (const line of map.context.split("\n")) assert(!line.endsWith("-"));
+});
+
+test("buildProjectMap reports the TS/JS source-file count", () => {
+  const map = buildProjectMap({
+    scannedPath: ".",
+    readmePath: null,
+    manifestPaths: [],
+    sourceFiles: ["src/app.ts", "src/view.tsx", "scripts/tool.js", "scripts/build.py"],
+    unsupportedFiles: [],
+    tree: "",
+    totalRelevantFiles: 4,
+    returnedFileCount: 4,
+    truncated: false
+  });
+
+  assert.equal(map.status, "loaded");
+  if (map.status !== "loaded") return;
+  assert.match(map.context, /TS\/JS source files: 3/);
+});
+
+test("buildProjectMap returns unavailable for malformed scan results", () => {
+  for (const value of [null, {}, { readmePath: null, manifestPaths: [], sourceFiles: [], unsupportedFiles: [], tree: "", totalRelevantFiles: 0, returnedFileCount: 0, truncated: "false" }, { scannedPath: ".", readmePath: null, manifestPaths: [1], sourceFiles: [], unsupportedFiles: [], tree: "", totalRelevantFiles: 0, returnedFileCount: 0, truncated: false }]) {
+    assert.deepEqual(buildProjectMap(value), { status: "unavailable", context: "" });
+  }
+});
+
+test("buildProjectMap accepts the exact scan content shape and sorts derived facts", () => {
+  const map = buildProjectMap({
+    scannedPath: ".",
+    readmePath: "README.md",
+    manifestPaths: ["tsconfig.json", "package.json"],
+    sourceFiles: ["src/server.ts", "lib/main.ts", "src/index.ts"],
+    unsupportedFiles: [],
+    tree: "",
+    totalRelevantFiles: 6,
+    returnedFileCount: 6,
+    truncated: false
+  });
+
+  assert.equal(map.status, "loaded");
+  if (map.status !== "loaded") return;
+  assert.match(map.context, /Manifests: package\.json, tsconfig\.json/);
+  assert.match(map.context, /Candidate TS\/JS entry points: lib\/main\.ts, src\/index\.ts, src\/server\.ts/);
+  assert.match(map.context, /Directories: lib \(1\), src \(2\)/);
 });
 
 function approvalRequest(permission: ApprovalRequest["permission"], argumentsValue: unknown = { path: "secret.txt" }): ApprovalRequest {

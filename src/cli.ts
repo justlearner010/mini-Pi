@@ -24,6 +24,64 @@ export type GlobalPreference = { provider: ProviderName; model: string };
 export type KeySource = "environment" | "credential-store";
 export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
 export const CREDENTIAL_SERVICE = "mini-Pi";
+export const PROJECT_MAP_MAX_CHARACTERS = 4_000;
+export type ProjectMap = { status: "loaded"; context: string; totalFiles: number; entryCandidates: number } | { status: "unavailable"; context: "" };
+type ScanProjectResult = { scannedPath: string; readmePath: string | null; manifestPaths: string[]; sourceFiles: string[]; unsupportedFiles: string[]; tree: string; totalRelevantFiles: number; returnedFileCount: number; truncated: boolean };
+
+function isScanProjectResult(value: unknown): value is ScanProjectResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  const expected = ["scannedPath", "readmePath", "manifestPaths", "sourceFiles", "unsupportedFiles", "tree", "totalRelevantFiles", "returnedFileCount", "truncated"];
+  if (Object.keys(item).length !== expected.length || !expected.every((key) => Object.hasOwn(item, key))) return false;
+  return typeof item.scannedPath === "string"
+    && (item.readmePath === null || typeof item.readmePath === "string")
+    && [item.manifestPaths, item.sourceFiles, item.unsupportedFiles].every((paths) => Array.isArray(paths) && paths.every((path) => typeof path === "string"))
+    && typeof item.tree === "string"
+    && typeof item.totalRelevantFiles === "number" && Number.isSafeInteger(item.totalRelevantFiles) && item.totalRelevantFiles >= 0
+    && typeof item.returnedFileCount === "number" && Number.isSafeInteger(item.returnedFileCount) && item.returnedFileCount >= 0
+    && typeof item.truncated === "boolean";
+}
+
+function counted(values: string[]): string {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return [...counts].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([value, count]) => `${value} (${count})`).join(", ");
+}
+
+function languageFor(path: string): string | undefined {
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  return ({ ts: "TypeScript", tsx: "TSX", js: "JavaScript", jsx: "JSX", mjs: "JavaScript", cjs: "JavaScript", py: "Python", rs: "Rust", go: "Go", java: "Java", rb: "Ruby", php: "PHP", cs: "C#", cpp: "C++", cc: "C++", c: "C", h: "C/C++", swift: "Swift", kt: "Kotlin", kts: "Kotlin", sh: "Shell", bash: "Shell", zsh: "Shell", sql: "SQL" } as Record<string, string>)[extension];
+}
+
+export function buildProjectMap(value: unknown): ProjectMap {
+  if (!isScanProjectResult(value)) return { status: "unavailable", context: "" };
+  const sourceFiles = [...value.sourceFiles].sort();
+  const tsJsSourceFileCount = sourceFiles.filter((path) => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(path)).length;
+  const entries = sourceFiles.filter((path) => /(?:^|\/)(?:index|main|server|app|cli)\.(?:[cm]?[jt]sx?)$/i.test(path));
+  const sourceDirectories = sourceFiles.map((path) => dirname(path));
+  const languages = [...sourceFiles, ...value.unsupportedFiles].map(languageFor).filter((language): language is string => Boolean(language));
+  const lines = [
+    `Project map (${value.totalRelevantFiles} relevant files)`,
+    value.truncated ? `Scan truncated: ${value.returnedFileCount} of ${value.totalRelevantFiles} relevant files returned` : undefined,
+    value.readmePath ? `README: ${value.readmePath}` : undefined,
+    value.manifestPaths.length ? `Manifests: ${[...value.manifestPaths].sort().join(", ")}` : undefined,
+    `Source files: ${sourceFiles.length}; unsupported files: ${value.unsupportedFiles.length}`,
+    `TS/JS source files: ${tsJsSourceFileCount}`,
+    entries.length ? `Candidate TS/JS entry points: ${entries.join(", ")}` : undefined,
+    sourceDirectories.length ? `Directories: ${counted(sourceDirectories)}` : undefined,
+    languages.length ? `Languages: ${counted(languages)}` : undefined,
+    sourceDirectories.length ? `Candidate areas: ${counted(sourceDirectories)}` : undefined
+  ].filter((line): line is string => Boolean(line));
+  const omission = `Omitted map details due to ${PROJECT_MAP_MAX_CHARACTERS}-character limit`;
+  const context: string[] = [];
+  let omitted = false;
+  for (const line of lines) {
+    const length = context.length ? context.join("\n").length + 1 + line.length : line.length;
+    if (length <= PROJECT_MAP_MAX_CHARACTERS - omission.length - 1) context.push(line);
+    else omitted = true;
+  }
+  return { status: "loaded", context: omitted ? [...context, omission].join("\n") : lines.join("\n"), totalFiles: value.totalRelevantFiles, entryCandidates: entries.length };
+}
 export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
 const require = createRequire(import.meta.url);
 
