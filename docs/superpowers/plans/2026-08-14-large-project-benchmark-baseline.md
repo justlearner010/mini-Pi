@@ -269,7 +269,8 @@ On success print exactly:
 
 Run:
 
-    npm run benchmark:large > /tmp/mini-pi-benchmark.json
+    npm run build
+    node scripts/benchmark-large-project.mjs > /tmp/mini-pi-benchmark.json
     npm run verify:benchmark
 
 Create docs/experiments/8-benchmark-baseline.md with the baseline and candidate
