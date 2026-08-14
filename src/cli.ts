@@ -53,12 +53,18 @@ function languageFor(path: string): string | undefined {
   return ({ ts: "TypeScript", tsx: "TSX", js: "JavaScript", jsx: "JSX", mjs: "JavaScript", cjs: "JavaScript", py: "Python", rs: "Rust", go: "Go", java: "Java", rb: "Ruby", php: "PHP", cs: "C#", cpp: "C++", cc: "C++", c: "C", h: "C/C++", swift: "Swift", kt: "Kotlin", kts: "Kotlin", sh: "Shell", bash: "Shell", zsh: "Shell", sql: "SQL" } as Record<string, string>)[extension];
 }
 
+function directoriesFor(path: string): string[] {
+  const directories: string[] = [];
+  for (let directory = dirname(path); directory !== "."; directory = dirname(directory)) directories.push(directory);
+  return directories;
+}
+
 export function buildProjectMap(value: unknown): ProjectMap {
   if (!isScanProjectResult(value)) return { status: "unavailable", context: "" };
   const sourceFiles = [...value.sourceFiles].sort();
   const tsJsSourceFileCount = sourceFiles.filter((path) => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(path)).length;
   const entries = sourceFiles.filter((path) => /(?:^|\/)(?:index|main|server|app|cli)\.(?:[cm]?[jt]sx?)$/i.test(path));
-  const sourceDirectories = sourceFiles.map((path) => dirname(path));
+  const sourceDirectories = [...sourceFiles, ...value.unsupportedFiles].flatMap(directoriesFor);
   const languages = [...sourceFiles, ...value.unsupportedFiles].map(languageFor).filter((language): language is string => Boolean(language));
   const lines = [
     `Project map (${value.totalRelevantFiles} relevant files)`,

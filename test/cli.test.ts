@@ -59,9 +59,9 @@ test("buildProjectMap renders a stable language-aware project overview", () => {
       "Source files: 3; unsupported files: 1",
       "TS/JS source files: 2",
       "Candidate TS/JS entry points: src/index.ts, src/server.ts",
-      "Directories: scripts (1), src (2)",
+      "Directories: assets (1), scripts (1), src (2)",
       "Languages: Python (1), TypeScript (2)",
-      "Candidate areas: scripts (1), src (2)"
+      "Candidate areas: assets (1), scripts (1), src (2)"
     ].join("\n")
   });
 });
@@ -105,6 +105,25 @@ test("buildProjectMap reports the TS/JS source-file count", () => {
   assert.equal(map.status, "loaded");
   if (map.status !== "loaded") return;
   assert.match(map.context, /TS\/JS source files: 3/);
+});
+
+test("buildProjectMap includes unsupported-language directories and languages", () => {
+  const map = buildProjectMap({
+    scannedPath: ".",
+    readmePath: null,
+    manifestPaths: [],
+    sourceFiles: [],
+    unsupportedFiles: ["service/app.py", "service/lib/db.py"],
+    tree: "",
+    totalRelevantFiles: 2,
+    returnedFileCount: 2,
+    truncated: false
+  });
+
+  assert.equal(map.status, "loaded");
+  if (map.status !== "loaded") return;
+  assert.match(map.context, /Directories: service \(2\), service\/lib \(1\)/);
+  assert.match(map.context, /Languages: Python \(2\)/);
 });
 
 test("buildProjectMap returns unavailable for malformed scan results", () => {
