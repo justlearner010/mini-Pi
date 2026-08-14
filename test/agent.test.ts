@@ -184,6 +184,21 @@ test("allows final answer on maxTurns and rejects only when another model call i
   assert.deepEqual(events.slice(-2), [{ type: "error", stage: "agent", message: "Agent reached maximum turns" }, { type: "agent_end", answer: "", turns: 8 }]);
 });
 
+test("defaults to sixteen turns while an explicit one-turn limit still stops after a tool call", async () => {
+  const sixteen = fakeLLM(Array.from({ length: 16 }, (_, i) => response(i === 15 ? "done" : null, i === 15 ? [] : [{ id: String(i), name: "noop", arguments: "{}" }])));
+  const defaultAgent = new Agent({ llm: sixteen.llm, tools: [tool("noop", async () => ({ content: "", isError: false }))], systemPrompt: "r", rootDir: "/p" });
+  const result = await defaultAgent.run("x");
+  assert.equal(result.answer, "done");
+  assert.equal(result.turns, 16);
+
+  const one = fakeLLM([response(null, [{ id: "only", name: "noop", arguments: "{}" }])]);
+  let executions = 0;
+  const limitedAgent = new Agent({ llm: one.llm, tools: [tool("noop", async () => { executions += 1; return { content: "", isError: false }; })], systemPrompt: "r", rootDir: "/p", maxTurns: 1 });
+  await assert.rejects(() => limitedAgent.run("x"), /maximum turns/i);
+  assert.equal(executions, 1);
+  assert.equal(one.requests.length, 1);
+});
+
 test("reset restores only the system prompt and provider failures rollback a run", async () => {
   const fake = fakeLLM([response("saved"), new Error("secret exposed"), response("fresh")]);
   const events: AgentEvent[] = [];

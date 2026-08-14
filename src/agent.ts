@@ -33,6 +33,7 @@ export interface AgentConfig {
   requestApproval?: RequestApproval;
   messages?: Message[];
 }
+export const DEFAULT_MAX_TURNS = 16;
 export interface AgentResult { answer: string; messages: Message[]; turns: number; }
 
 function content(value: unknown): string {
@@ -61,7 +62,7 @@ export class Agent {
     this.tools = config.tools;
     this.systemPrompt = config.systemPrompt;
     this.rootDir = config.rootDir;
-    this.maxTurns = config.maxTurns ?? 8;
+    this.maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
     this.onEvent = config.onEvent;
     this.requestApproval = config.requestApproval;
     this.messages = structuredClone(config.messages ?? [{ role: "system", content: this.systemPrompt }]);
