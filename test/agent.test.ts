@@ -199,6 +199,16 @@ test("defaults to sixteen turns while an explicit one-turn limit still stops aft
   assert.equal(one.requests.length, 1);
 });
 
+test("default turn limit rejects after sixteen tool-call turns", async () => {
+  const sixteen = fakeLLM(Array.from({ length: 16 }, (_, i) => response(null, [{ id: String(i), name: "noop", arguments: "{}" }])));
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ llm: sixteen.llm, tools: [tool("noop", async () => ({ content: "", isError: false }))], systemPrompt: "r", rootDir: "/p", onEvent: (event) => events.push(event) });
+
+  await assert.rejects(() => agent.run("x"), /maximum turns/i);
+  assert.equal(sixteen.requests.length, 16);
+  assert.deepEqual(events.slice(-2), [{ type: "error", stage: "agent", message: "Agent reached maximum turns" }, { type: "agent_end", answer: "", turns: 16 }]);
+});
+
 test("reset restores only the system prompt and provider failures rollback a run", async () => {
   const fake = fakeLLM([response("saved"), new Error("secret exposed"), response("fresh")]);
   const events: AgentEvent[] = [];
