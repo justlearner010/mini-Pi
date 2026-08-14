@@ -166,6 +166,7 @@ Expected: scan and manifest assertions pass without network access.
 Add this package script:
 
     "benchmark:large": "npm run build && node scripts/benchmark-large-project.mjs"
+    "benchmark:large:json": "node scripts/benchmark-large-project.mjs"
 
 Run:
 
@@ -193,9 +194,13 @@ For each normal fixture return, in order: scan_project, read_file package.json,
 analyze_dependencies for that fixture entry, then a final answer. Entries are
 src/index.ts, packages/api/src/main.ts, and src/server.ts respectively.
 
-Also run an over-limit scenario whose first nine replies each call
+Also run a capacity-boundary scenario whose first nine replies each call
 scan_project, followed by a final answer. It must produce maximum_turns for
-maxTurns 8 and answered with 10 turns for maxTurns 16.
+maxTurns 8 and answered with 10 turns for maxTurns 16. Run a separate
+beyond-default scenario with seventeen scan_project replies followed by a
+final answer; at maxTurns 16 it must produce maximum_turns. The complete
+document therefore has nine runs: six normal fixture runs, two
+capacity-boundary runs, and one beyond-default run.
 
 Print one JSON document only:
 
@@ -227,11 +232,16 @@ It is reported but not used for deterministic equality.
 Run:
 
     npm run benchmark:large
+    npm run build
+    npm run benchmark:large:json
     git add package.json scripts/benchmark-large-project.mjs
     git commit -m "feat: add deterministic large-project benchmark"
 
-Expected: JSON has 8-turn and 16-turn records for three normal fixtures and
-the over-limit scenario.
+Expected: benchmark:large builds and then prints one JSON document. After a
+build, benchmark:large:json runs the benchmark directly and prints only the
+same nine-run JSON document: 8-turn and 16-turn records for three normal
+fixtures, both capacity-boundary records, and the 16-turn beyond-default
+record.
 
 ### Task 4: Verify repeatability and publish the report
 
