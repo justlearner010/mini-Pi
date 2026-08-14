@@ -46,9 +46,18 @@ function normalReplies(entry) {
   ];
 }
 
-function overLimitReplies() {
+function capacityBoundaryReplies() {
   return [
     ...Array.from({ length: 9 }, (_, index) =>
+      toolCall(`scan-${index + 1}`, "scan_project", {})
+    ),
+    finalAnswer()
+  ];
+}
+
+function beyondDefaultReplies() {
+  return [
+    ...Array.from({ length: 17 }, (_, index) =>
       toolCall(`scan-${index + 1}`, "scan_project", {})
     ),
     finalAnswer()
@@ -74,8 +83,22 @@ function measuredTools(metrics) {
       if (tool.name === "read_file") metrics.filesRead += 1;
       const result = await tool.execute(args, context);
       const serialized = JSON.stringify(result.content);
-      metrics.returnedFileBytes += Buffer.byteLength(serialized);
+      if (typeof serialized !== "string") throw new Error(`Unable to serialize ${tool.name} result content`);
       metrics.toolResultCharacters += serialized.length;
+      if (tool.name === "read_file") {
+        const content = result.content;
+        if (result.isError || !content || typeof content !== "object" || Array.isArray(content) || typeof content.content !== "string") {
+          throw new Error("Unable to derive returned file bytes from read_file result");
+        }
+        metrics.returnedFileBytes += Buffer.byteLength(content.content);
+      }
+      if (tool.name === "analyze_dependencies") {
+        const content = result.content;
+        if (result.isError || !content || typeof content !== "object" || Array.isArray(content) || !Number.isInteger(content.analyzedFileCount) || content.analyzedFileCount < 0) {
+          throw new Error("Unable to derive analyzed source file count from analyze_dependencies result");
+        }
+        metrics.filesRead += content.analyzedFileCount;
+      }
       return result;
     }
   }));
@@ -84,8 +107,8 @@ function measuredTools(metrics) {
 function scriptedLLM(replies, metrics) {
   let nextReply = 0;
   return {
-    async generate(messages) {
-      metrics.requestCharacters += JSON.stringify(messages).length;
+    async generate(messages, availableTools) {
+      metrics.requestCharacters += JSON.stringify({ messages, tools: availableTools }).length;
       metrics.modelRequests += 1;
       const message = replies[nextReply];
       if (!message) throw new Error("Scripted LLM exhausted its replies");
@@ -143,12 +166,19 @@ for (const fixture of fixtures) {
 
 for (const maxTurns of [8, 16]) {
   runs.push(await runBenchmark({
-    fixture: "over-limit",
+    fixture: "capacity-boundary",
     rootDir: fixtures[0].rootDir,
     maxTurns,
-    replies: overLimitReplies()
+    replies: capacityBoundaryReplies()
   }));
 }
+
+runs.push(await runBenchmark({
+  fixture: "beyond-default",
+  rootDir: fixtures[0].rootDir,
+  maxTurns: 16,
+  replies: beyondDefaultReplies()
+}));
 
 runs.sort((left, right) =>
   left.fixture.localeCompare(right.fixture) || left.maxTurns - right.maxTurns
