@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node packages/api/src/main.ts"
+    "start": "node --import tsx packages/api/src/main.ts"
   }
 }

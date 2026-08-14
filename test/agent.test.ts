@@ -42,16 +42,19 @@ test("efficiency fixtures expose stable project layouts and dependency relations
   assert.equal(alphaScan.isError, false);
   assert.deepEqual((alphaScan.content as { sourceFiles: string[] }).sourceFiles, ["src/auth/session.ts", "src/index.ts", "src/unused/report.ts"]);
 
-  const alphaManifest = await byName("read_file").execute({ path: "package.json" }, { rootDir: fixture("alpha-service") });
-  assert.equal(alphaManifest.isError, false);
-  assert.equal(JSON.parse((alphaManifest.content as { content: string }).content).name, "alpha-service");
-
   const cases = [
     ["alpha-service", "src/index.ts", ["src/auth/session.ts", "src/index.ts", "src/unused/report.ts"], ["src/index.ts", "src/auth/session.ts"]],
     ["beta-workspace", "packages/api/src/main.ts", ["packages/api/src/main.ts", "packages/api/src/router.ts", "packages/web/src/app.ts"], ["packages/api/src/main.ts", "packages/api/src/router.ts"]],
     ["gamma-layered", "src/server.ts", ["src/domain/orders.ts", "src/infra/store.ts", "src/server.ts"], ["src/server.ts", "src/domain/orders.ts", "src/infra/store.ts"]]
   ] as const;
   for (const [name, entry, analyzedFiles, entryFiles] of cases) {
+    const manifest = await byName("read_file").execute({ path: "package.json" }, { rootDir: fixture(name) });
+    assert.equal(manifest.isError, false);
+    const packageJson = JSON.parse((manifest.content as { content: string }).content) as { name: string; type: string; scripts: { start: string } };
+    assert.equal(packageJson.name, name);
+    assert.equal(packageJson.type, "module");
+    assert.equal(packageJson.scripts.start, `node --import tsx ${entry}`);
+
     const analysis = await byName("analyze_dependencies").execute({ entry }, { rootDir: fixture(name) });
     assert.equal(analysis.isError, false);
     const content = analysis.content as { analyzedFiles: string[]; entryTree: string | null };
