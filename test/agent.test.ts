@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { Agent, type AgentEvent, type AgentResult, type ApprovalRequest } from "../src/agent.js";
 import { ProviderDiagnostic, type LLMClient, type Message, type ModelResponse } from "../src/llm.js";
-import type { Tool } from "../src/tool.js";
+import { tools, type Tool } from "../src/tool.js";
 
 function response(content: string | null, toolCalls: ModelResponse["message"]["toolCalls"] = []): ModelResponse {
   return { message: { role: "assistant", content, toolCalls } };
@@ -28,6 +29,36 @@ function tool(name: string, execute: Tool["execute"]): Tool {
 function approvalTool(permission: "SENSITIVE" | "DESTRUCTIVE", execute: Tool["execute"]): Tool {
   return { name: "guarded", description: "guarded", parameters: { type: "object" }, permission, reason: "This operation needs explicit approval", risk: "medium", execute };
 }
+
+test("efficiency fixtures expose stable project layouts and dependency relationships", async () => {
+  const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/efficiency/${name}`, import.meta.url));
+  const byName = (name: string) => {
+    const found = tools.find((candidate) => candidate.name === name);
+    assert(found, `missing ${name} tool`);
+    return found;
+  };
+
+  const alphaScan = await byName("scan_project").execute({}, { rootDir: fixture("alpha-service") });
+  assert.equal(alphaScan.isError, false);
+  assert.deepEqual((alphaScan.content as { sourceFiles: string[] }).sourceFiles, ["src/auth/session.ts", "src/index.ts", "src/unused/report.ts"]);
+
+  const alphaManifest = await byName("read_file").execute({ path: "package.json" }, { rootDir: fixture("alpha-service") });
+  assert.equal(alphaManifest.isError, false);
+  assert.equal(JSON.parse((alphaManifest.content as { content: string }).content).name, "alpha-service");
+
+  const cases = [
+    ["alpha-service", "src/index.ts", ["src/auth/session.ts", "src/index.ts", "src/unused/report.ts"], ["src/index.ts", "src/auth/session.ts"]],
+    ["beta-workspace", "packages/api/src/main.ts", ["packages/api/src/main.ts", "packages/api/src/router.ts", "packages/web/src/app.ts"], ["packages/api/src/main.ts", "packages/api/src/router.ts"]],
+    ["gamma-layered", "src/server.ts", ["src/domain/orders.ts", "src/infra/store.ts", "src/server.ts"], ["src/server.ts", "src/domain/orders.ts", "src/infra/store.ts"]]
+  ] as const;
+  for (const [name, entry, analyzedFiles, entryFiles] of cases) {
+    const analysis = await byName("analyze_dependencies").execute({ entry }, { rootDir: fixture(name) });
+    assert.equal(analysis.isError, false);
+    const content = analysis.content as { analyzedFiles: string[]; entryTree: string | null };
+    assert.deepEqual(content.analyzedFiles, analyzedFiles);
+    assert.equal(content.entryTree, entryFiles.map((file, index) => `${"  ".repeat(index)}${file}`).join("\n"));
+  }
+});
 
 test("returns a direct answer and retains shared history", async () => {
   const fake = fakeLLM([response("first"), response("second")]);
