@@ -10,7 +10,9 @@ import {
   createSystemCredentialStore,
   debugEnabled,
   loginWithCredentialStore,
+  loadProjectMap,
   logoutFromCredentialStore,
+  mapSystemPrompt,
   exitCodeFor,
   getStartupSelection,
   parseArgs,
@@ -129,6 +131,40 @@ test("buildProjectMap includes unsupported-language directories and languages", 
 test("buildProjectMap returns unavailable for malformed scan results", () => {
   for (const value of [null, {}, { readmePath: null, manifestPaths: [], sourceFiles: [], unsupportedFiles: [], tree: "", totalRelevantFiles: 0, returnedFileCount: 0, truncated: "false" }, { scannedPath: ".", readmePath: null, manifestPaths: [1], sourceFiles: [], unsupportedFiles: [], tree: "", totalRelevantFiles: 0, returnedFileCount: 0, truncated: false }]) {
     assert.deepEqual(buildProjectMap(value), { status: "unavailable", context: "" });
+  }
+});
+
+test("loadProjectMap scans the selected root once and composes map context once", async () => {
+  let calls = 0;
+  const map = await loadProjectMap("/project", {
+    async execute(args, context) {
+      calls += 1;
+      assert.deepEqual(args, {});
+      assert.deepEqual(context, { rootDir: "/project" });
+      return {
+        isError: false,
+        content: {
+          scannedPath: ".", readmePath: null, manifestPaths: [], sourceFiles: ["src/main.ts"], unsupportedFiles: [], tree: "", totalRelevantFiles: 1, returnedFileCount: 1, truncated: false
+        }
+      };
+    }
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(map.status, "loaded");
+  assert.equal((mapSystemPrompt(map).match(/Project map/g) ?? []).length, 1);
+  assert(!mapSystemPrompt(map).includes('"sourceFiles"'));
+});
+
+test("loadProjectMap safely falls back when scanning fails", async () => {
+  for (const scan of [
+    { async execute() { throw new Error("scan failed"); } },
+    { async execute() { return { isError: true, content: "scan failed" }; } },
+    { async execute() { return { isError: false, content: { malformed: true } }; } }
+  ]) {
+    const map = await loadProjectMap("/project", scan as never);
+    assert.deepEqual(map, { status: "unavailable", context: "" });
+    assert.equal(mapSystemPrompt(map), SYSTEM_PROMPT);
   }
 });
 

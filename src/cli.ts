@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { Agent, type AgentEvent, type RequestApproval } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
-import { tools } from "./tool.js";
+import { scanProjectTool, tools, type Tool } from "./tool.js";
 import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, TuiView, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
@@ -87,6 +87,19 @@ export function buildProjectMap(value: unknown): ProjectMap {
     else omitted = true;
   }
   return { status: "loaded", context: omitted ? [...context, omission].join("\n") : lines.join("\n"), totalFiles: value.totalRelevantFiles, entryCandidates: entries.length };
+}
+
+export async function loadProjectMap(rootDir: string, scan: Pick<Tool, "execute"> = scanProjectTool): Promise<ProjectMap> {
+  try {
+    const result = await scan.execute({}, { rootDir });
+    return result.isError ? { status: "unavailable", context: "" } : buildProjectMap(result.content);
+  } catch {
+    return { status: "unavailable", context: "" };
+  }
+}
+
+export function mapSystemPrompt(map: ProjectMap): string {
+  return map.status === "loaded" ? `${SYSTEM_PROMPT}\n\n${map.context}` : SYSTEM_PROMPT;
 }
 export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
 const require = createRequire(import.meta.url);
@@ -258,8 +271,8 @@ For full-project analysis, include:
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
 function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
-function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
-  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
+function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, systemPrompt: string, onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
+  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt, onEvent, requestApproval, messages });
 }
 
 export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log): Promise<number> {
@@ -296,15 +309,17 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
   const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
+  const projectMap = await loadProjectMap(valid.rootDir!);
+  const systemPrompt = mapSystemPrompt(projectMap);
   if (valid.prompt) {
-    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, (event) => {
+    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, systemPrompt, (event) => {
       const text = formatEvent(event, debugEnabled(env));
       if (text) console.log(text);
     }, requestApproval);
     return runOneShot(agent, valid.prompt);
   }
   const view = new TuiView({ write: (text) => process.stdout.write(text), provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, view.onEvent.bind(view), requestApproval, history) });
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, systemPrompt, view.onEvent.bind(view), requestApproval, history) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {
     login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
