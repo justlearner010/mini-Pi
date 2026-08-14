@@ -1,0 +1,8 @@
+{
+  "name": "alpha-service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx src/index.ts"
+  }
+}

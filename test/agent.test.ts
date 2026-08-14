@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { Agent, type AgentEvent, type AgentResult, type ApprovalRequest } from "../src/agent.js";
 import { ProviderDiagnostic, type LLMClient, type Message, type ModelResponse } from "../src/llm.js";
-import type { Tool } from "../src/tool.js";
+import { tools, type Tool } from "../src/tool.js";
 
 function response(content: string | null, toolCalls: ModelResponse["message"]["toolCalls"] = []): ModelResponse {
   return { message: { role: "assistant", content, toolCalls } };
@@ -28,6 +29,39 @@ function tool(name: string, execute: Tool["execute"]): Tool {
 function approvalTool(permission: "SENSITIVE" | "DESTRUCTIVE", execute: Tool["execute"]): Tool {
   return { name: "guarded", description: "guarded", parameters: { type: "object" }, permission, reason: "This operation needs explicit approval", risk: "medium", execute };
 }
+
+test("efficiency fixtures expose stable project layouts and dependency relationships", async () => {
+  const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/efficiency/${name}`, import.meta.url));
+  const byName = (name: string) => {
+    const found = tools.find((candidate) => candidate.name === name);
+    assert(found, `missing ${name} tool`);
+    return found;
+  };
+
+  const alphaScan = await byName("scan_project").execute({}, { rootDir: fixture("alpha-service") });
+  assert.equal(alphaScan.isError, false);
+  assert.deepEqual((alphaScan.content as { sourceFiles: string[] }).sourceFiles, ["src/auth/session.ts", "src/index.ts", "src/unused/report.ts"]);
+
+  const cases = [
+    ["alpha-service", "src/index.ts", ["src/auth/session.ts", "src/index.ts", "src/unused/report.ts"], ["src/index.ts", "src/auth/session.ts"]],
+    ["beta-workspace", "packages/api/src/main.ts", ["packages/api/src/main.ts", "packages/api/src/router.ts", "packages/web/src/app.ts"], ["packages/api/src/main.ts", "packages/api/src/router.ts"]],
+    ["gamma-layered", "src/server.ts", ["src/domain/orders.ts", "src/infra/store.ts", "src/server.ts"], ["src/server.ts", "src/domain/orders.ts", "src/infra/store.ts"]]
+  ] as const;
+  for (const [name, entry, analyzedFiles, entryFiles] of cases) {
+    const manifest = await byName("read_file").execute({ path: "package.json" }, { rootDir: fixture(name) });
+    assert.equal(manifest.isError, false);
+    const packageJson = JSON.parse((manifest.content as { content: string }).content) as { name: string; type: string; scripts: { start: string } };
+    assert.equal(packageJson.name, name);
+    assert.equal(packageJson.type, "module");
+    assert.equal(packageJson.scripts.start, `node --import tsx ${entry}`);
+
+    const analysis = await byName("analyze_dependencies").execute({ entry }, { rootDir: fixture(name) });
+    assert.equal(analysis.isError, false);
+    const content = analysis.content as { analyzedFiles: string[]; entryTree: string | null };
+    assert.deepEqual(content.analyzedFiles, analyzedFiles);
+    assert.equal(content.entryTree, entryFiles.map((file, index) => `${"  ".repeat(index)}${file}`).join("\n"));
+  }
+});
 
 test("returns a direct answer and retains shared history", async () => {
   const fake = fakeLLM([response("first"), response("second")]);
@@ -182,6 +216,31 @@ test("allows final answer on maxTurns and rejects only when another model call i
   await assert.rejects(() => config(nine.llm, (event) => events.push(event)).run("x"), /maximum turns/i);
   assert.equal(nine.requests.length, 8);
   assert.deepEqual(events.slice(-2), [{ type: "error", stage: "agent", message: "Agent reached maximum turns" }, { type: "agent_end", answer: "", turns: 8 }]);
+});
+
+test("defaults to sixteen turns while an explicit one-turn limit still stops after a tool call", async () => {
+  const sixteen = fakeLLM(Array.from({ length: 16 }, (_, i) => response(i === 15 ? "done" : null, i === 15 ? [] : [{ id: String(i), name: "noop", arguments: "{}" }])));
+  const defaultAgent = new Agent({ llm: sixteen.llm, tools: [tool("noop", async () => ({ content: "", isError: false }))], systemPrompt: "r", rootDir: "/p" });
+  const result = await defaultAgent.run("x");
+  assert.equal(result.answer, "done");
+  assert.equal(result.turns, 16);
+
+  const one = fakeLLM([response(null, [{ id: "only", name: "noop", arguments: "{}" }])]);
+  let executions = 0;
+  const limitedAgent = new Agent({ llm: one.llm, tools: [tool("noop", async () => { executions += 1; return { content: "", isError: false }; })], systemPrompt: "r", rootDir: "/p", maxTurns: 1 });
+  await assert.rejects(() => limitedAgent.run("x"), /maximum turns/i);
+  assert.equal(executions, 1);
+  assert.equal(one.requests.length, 1);
+});
+
+test("default turn limit rejects after sixteen tool-call turns", async () => {
+  const sixteen = fakeLLM(Array.from({ length: 16 }, (_, i) => response(null, [{ id: String(i), name: "noop", arguments: "{}" }])));
+  const events: AgentEvent[] = [];
+  const agent = new Agent({ llm: sixteen.llm, tools: [tool("noop", async () => ({ content: "", isError: false }))], systemPrompt: "r", rootDir: "/p", onEvent: (event) => events.push(event) });
+
+  await assert.rejects(() => agent.run("x"), /maximum turns/i);
+  assert.equal(sixteen.requests.length, 16);
+  assert.deepEqual(events.slice(-2), [{ type: "error", stage: "agent", message: "Agent reached maximum turns" }, { type: "agent_end", answer: "", turns: 16 }]);
 });
 
 test("reset restores only the system prompt and provider failures rollback a run", async () => {

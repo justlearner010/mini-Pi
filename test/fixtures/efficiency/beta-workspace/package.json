@@ -1,0 +1,8 @@
+{
+  "name": "beta-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx packages/api/src/main.ts"
+  }
+}

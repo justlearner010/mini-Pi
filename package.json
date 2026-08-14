@@ -11,6 +11,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "benchmark:large": "npm run build && node scripts/benchmark-large-project.mjs",
+    "benchmark:large:json": "node scripts/benchmark-large-project.mjs",
+    "verify:benchmark": "npm run build && node scripts/verify-benchmark.mjs",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/**/*.test.ts",
     "verify:bin": "node scripts/verify-bin.mjs",
