@@ -39,6 +39,22 @@ npm run verify:benchmark
 The runner uses only fixed repository fixtures, scripted model replies, and
 read-only local tools. It makes no Provider or network calls.
 
+### Fixture questions, revision, and Provider status
+
+The fixture revision is the `d9ef9e0` harness checkout named in the revision
+context. Each fixture uses the same fixed question classes required by the
+governing design:
+
+1. Where is the executable entry point and how is it started?
+2. How does one named core module connect to its callers and dependencies?
+3. Give a project overview, important directories, and explicit analysis
+   limits.
+
+No Provider or model was used for this deterministic run, so Provider model,
+timestamp, response usage, and reported input/cost are unavailable. This
+report does not estimate them from characters; the owner-run section records
+the required manual comparison instead.
+
 ## Metric definitions and limits
 
 | Metric | Definition |
@@ -82,16 +98,49 @@ default remains a finite boundary rather than permitting unbounded work.
 
 ## File-backed quality rubric
 
-| Criterion | Score | Evidence |
-| --- | ---: | --- |
-| Manifest fact | 3/3 | Each package name is stored in [alpha-service/package.json](../../test/fixtures/efficiency/alpha-service/package.json), [beta-workspace/package.json](../../test/fixtures/efficiency/beta-workspace/package.json), and [gamma-layered/package.json](../../test/fixtures/efficiency/gamma-layered/package.json). |
-| Entry-point fact | 3/3 | The same manifests point to `src/index.ts`, `packages/api/src/main.ts`, and `src/server.ts`; the runner queries those exact entries. |
-| Dependency fact | 3/3 | [alpha index](../../test/fixtures/efficiency/alpha-service/src/index.ts) imports `auth/session`, [beta main](../../test/fixtures/efficiency/beta-workspace/packages/api/src/main.ts) imports `router`, and [gamma server](../../test/fixtures/efficiency/gamma-layered/src/server.ts) reaches `domain/orders` then `infra/store`. |
-| Stated-limit fact | 3/3 | The [runner](../../scripts/benchmark-large-project.mjs) encodes the normal, capacity-boundary, and beyond-default replies; the measured outcomes match all three stated boundaries. |
+The 8-turn and 16-turn normal traces use the same fixture facts, so neither
+side regresses on an applicable deterministic rubric item. The score below is
+for evidence recoverability in the scripted run, not a claim about an
+open-ended Provider answer.
 
-Score: 12/12 file-backed checks. This score means that the deterministic
-fixtures and scripted questions have recoverable evidence; it is not a score
-for open-ended model reasoning.
+| Criterion | Before (8) | Candidate (16) | Evidence |
+| --- | ---: | ---: | --- |
+| Manifest / build evidence | 3/3 | 3/3 | Each package name, `type`, and start script is stored in [alpha-service/package.json](../../test/fixtures/efficiency/alpha-service/package.json), [beta-workspace/package.json](../../test/fixtures/efficiency/beta-workspace/package.json), and [gamma-layered/package.json](../../test/fixtures/efficiency/gamma-layered/package.json). No framework-specific build fact is present, so none is claimed. |
+| Entry-point / start command | 3/3 | 3/3 | The same manifests point to `src/index.ts`, `packages/api/src/main.ts`, and `src/server.ts`; the [runner](../../scripts/benchmark-large-project.mjs) queries those exact entries. |
+| Important directory / module description | 3/3 | 3/3 | The runner first calls `scan_project`; source evidence identifies [alpha's session module](../../test/fixtures/efficiency/alpha-service/src/auth/session.ts), [beta's API router](../../test/fixtures/efficiency/beta-workspace/packages/api/src/router.ts), [beta's web app](../../test/fixtures/efficiency/beta-workspace/packages/web/src/app.ts), and [gamma's domain](../../test/fixtures/efficiency/gamma-layered/src/domain/orders.ts) / [infrastructure](../../test/fixtures/efficiency/gamma-layered/src/infra/store.ts) modules. |
+| Core-module dependency relationship | 3/3 | 3/3 | [alpha index](../../test/fixtures/efficiency/alpha-service/src/index.ts) imports `auth/session`, [beta main](../../test/fixtures/efficiency/beta-workspace/packages/api/src/main.ts) imports `router`, and [gamma server](../../test/fixtures/efficiency/gamma-layered/src/server.ts) reaches `domain/orders` then `infra/store`. |
+| Explicit uninspected / truncated scope | 3/3 | 3/3 | Normal traces invoke `scan_project`, read only `package.json` through `read_file`, then analyze the configured entry. They do not read [alpha's unused report](../../test/fixtures/efficiency/alpha-service/src/unused/report.ts), [beta's web app](../../test/fixtures/efficiency/beta-workspace/packages/web/src/app.ts), or fixture READMEs. The runner does not persist a scan truncation flag, so truncation status is unavailable rather than asserted absent. |
+| Stated-limit fact | 3/3 | 3/3 | The [runner](../../scripts/benchmark-large-project.mjs) encodes the normal, capacity-boundary, and beyond-default replies; the measured outcomes match all three stated boundaries. |
+
+Score: 18/18 file-backed checks for both limit settings. This only means that
+the deterministic fixtures and scripted questions have recoverable evidence;
+it is not a score for open-ended model reasoning.
+
+## Failures, variance, and trade-offs
+
+- Failures: the capacity-boundary trace reaches `maximum_turns` at 8, and the
+  beyond-default trace reaches `maximum_turns` at 16. A live Provider run and
+  Provider usage are unavailable, so real-world quality and cost remain
+  unvalidated.
+- Variance: `elapsedMs` differs between invocations (including process warm-up
+  effects), so it is excluded from the deep-equality check and is not compared
+  as a speed result. Every non-timing metric is repeatable under the scripted
+  harness.
+- Trade-off: 16 turns lets the capacity-boundary trace complete, but that
+  completed trace uses 10 model requests and 36,110 request characters versus
+  the 8-turn failure's 8 requests and 24,728 characters. The beyond-default
+  trace still spends 16 requests and 82,778 characters before stopping. This
+  is bounded extra capacity, not demonstrated context, token, or cost
+  reduction.
+
+## Recommendation
+
+**PASS for baseline instrumentation and the bounded 8-versus-16 capacity
+record. NOT evidence of cost reduction or real-Provider efficiency.** Keep
+this report as the locked deterministic baseline; do not close real-Provider
+validation until the owner-run matrix supplies pinned Provider/model, project
+revisions, timestamps, rubric outcomes, and Provider-reported usage when the
+Provider exposes it.
 
 ## Verification results
 
