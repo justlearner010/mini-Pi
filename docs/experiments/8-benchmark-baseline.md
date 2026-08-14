@@ -39,16 +39,22 @@ npm run verify:benchmark
 The runner uses only fixed repository fixtures, scripted model replies, and
 read-only local tools. It makes no Provider or network calls.
 
-### Fixture questions, revision, and Provider status
+### Governing question classes, fixture revision, and Provider status
 
 The fixture revision is the `d9ef9e0` harness checkout named in the revision
-context. Each fixture uses the same fixed question classes required by the
-governing design:
+context. The governing design defines these fixed question classes for
+downstream quality evaluation:
 
 1. Where is the executable entry point and how is it started?
 2. How does one named core module connect to its callers and dependencies?
 3. Give a project overview, important directories, and explicit analysis
    limits.
+
+This harness does not submit those natural-language questions or score their
+answers. It runs deterministic `scan_project`, manifest-read, and dependency
+analysis traces that correspond to their evidence dimensions, then returns the
+fixed final text `Project analysis complete.`. The trace therefore establishes
+tool and context baselines, not natural-language answer quality.
 
 No Provider or model was used for this deterministic run, so Provider model,
 timestamp, response usage, and reported input/cost are unavailable. This
@@ -96,25 +102,26 @@ elapsed time. At the capacity boundary, 8 fails after eight requests while 16
 succeeds on turn 10. The beyond-default case still fails at 16, so the new
 default remains a finite boundary rather than permitting unbounded work.
 
-## File-backed quality rubric
+## Quality-gate status and file-backed trace evidence
 
-The 8-turn and 16-turn normal traces use the same fixture facts, so neither
-side regresses on an applicable deterministic rubric item. The score below is
-for evidence recoverability in the scripted run, not a claim about an
-open-ended Provider answer.
+The 8-turn and 16-turn normal traces use the same fixture facts. They provide
+the trace evidence listed below, but do not produce an overview answer that can
+be scored against the governing quality rubric: the scripted final reply is
+only `Project analysis complete.`. Consequently, natural-language answer
+quality is **NOT MEASURED** for both limits; no non-regression claim is made.
 
-| Criterion | Before (8) | Candidate (16) | Evidence |
-| --- | ---: | ---: | --- |
-| Manifest / build evidence | 3/3 | 3/3 | Each package name, `type`, and start script is stored in [alpha-service/package.json](../../test/fixtures/efficiency/alpha-service/package.json), [beta-workspace/package.json](../../test/fixtures/efficiency/beta-workspace/package.json), and [gamma-layered/package.json](../../test/fixtures/efficiency/gamma-layered/package.json). No framework-specific build fact is present, so none is claimed. |
-| Entry-point / start command | 3/3 | 3/3 | The same manifests point to `src/index.ts`, `packages/api/src/main.ts`, and `src/server.ts`; the [runner](../../scripts/benchmark-large-project.mjs) queries those exact entries. |
-| Important directory / module description | 3/3 | 3/3 | The runner first calls `scan_project`; source evidence identifies [alpha's session module](../../test/fixtures/efficiency/alpha-service/src/auth/session.ts), [beta's API router](../../test/fixtures/efficiency/beta-workspace/packages/api/src/router.ts), [beta's web app](../../test/fixtures/efficiency/beta-workspace/packages/web/src/app.ts), and [gamma's domain](../../test/fixtures/efficiency/gamma-layered/src/domain/orders.ts) / [infrastructure](../../test/fixtures/efficiency/gamma-layered/src/infra/store.ts) modules. |
-| Core-module dependency relationship | 3/3 | 3/3 | [alpha index](../../test/fixtures/efficiency/alpha-service/src/index.ts) imports `auth/session`, [beta main](../../test/fixtures/efficiency/beta-workspace/packages/api/src/main.ts) imports `router`, and [gamma server](../../test/fixtures/efficiency/gamma-layered/src/server.ts) reaches `domain/orders` then `infra/store`. |
-| Explicit uninspected / truncated scope | 3/3 | 3/3 | Normal traces invoke `scan_project`, read only `package.json` through `read_file`, then analyze the configured entry. They do not read [alpha's unused report](../../test/fixtures/efficiency/alpha-service/src/unused/report.ts), [beta's web app](../../test/fixtures/efficiency/beta-workspace/packages/web/src/app.ts), or fixture READMEs. The runner does not persist a scan truncation flag, so truncation status is unavailable rather than asserted absent. |
-| Stated-limit fact | 3/3 | 3/3 | The [runner](../../scripts/benchmark-large-project.mjs) encodes the normal, capacity-boundary, and beyond-default replies; the measured outcomes match all three stated boundaries. |
+| Evidence dimension | Before (8) trace | Candidate (16) trace | Evidence |
+| --- | --- | --- | --- |
+| Manifest / build evidence | present | present | Each package name, `type`, and start script is stored in [alpha-service/package.json](../../test/fixtures/efficiency/alpha-service/package.json), [beta-workspace/package.json](../../test/fixtures/efficiency/beta-workspace/package.json), and [gamma-layered/package.json](../../test/fixtures/efficiency/gamma-layered/package.json). No framework-specific build fact is present, so none is claimed. |
+| Entry-point / start-command evidence | present | present | The same manifests point to `src/index.ts`, `packages/api/src/main.ts`, and `src/server.ts`; the [runner](../../scripts/benchmark-large-project.mjs) queries those exact entries. |
+| Important directory / module evidence | present | present | The runner first calls `scan_project`; source evidence identifies [alpha's session module](../../test/fixtures/efficiency/alpha-service/src/auth/session.ts), [beta's API router](../../test/fixtures/efficiency/beta-workspace/packages/api/src/router.ts), [beta's web app](../../test/fixtures/efficiency/beta-workspace/packages/web/src/app.ts), and [gamma's domain](../../test/fixtures/efficiency/gamma-layered/src/domain/orders.ts) / [infrastructure](../../test/fixtures/efficiency/gamma-layered/src/infra/store.ts) modules. |
+| Core-module dependency evidence | present | present | [alpha index](../../test/fixtures/efficiency/alpha-service/src/index.ts) imports `auth/session`, [beta main](../../test/fixtures/efficiency/beta-workspace/packages/api/src/main.ts) imports `router`, and [gamma server](../../test/fixtures/efficiency/gamma-layered/src/server.ts) reaches `domain/orders` then `infra/store`. |
+| Explicit uninspected / truncated scope | **NOT MEASURED** | **NOT MEASURED** | The trace shows that it invokes `scan_project`, reads only `package.json` through `read_file`, and does not read [alpha's unused report](../../test/fixtures/efficiency/alpha-service/src/unused/report.ts), [beta's web app](../../test/fixtures/efficiency/beta-workspace/packages/web/src/app.ts), or fixture READMEs. That is trace behavior, not a user-facing explicit limitation: the fixed final answer names neither uninspected files nor truncation. The runner also does not persist a scan truncation flag. |
+| Stated-limit trace evidence | present | present | The [runner](../../scripts/benchmark-large-project.mjs) encodes the normal, capacity-boundary, and beyond-default replies; the measured outcomes match all three stated boundaries. |
 
-Score: 18/18 file-backed checks for both limit settings. This only means that
-the deterministic fixtures and scripted questions have recoverable evidence;
-it is not a score for open-ended model reasoning.
+The trace establishes available evidence dimensions only. It does not pass the
+answer-quality gate, which awaits a real answer with cited facts and explicit
+scope limits.
 
 ## Failures, variance, and trade-offs
 
@@ -135,12 +142,12 @@ it is not a score for open-ended model reasoning.
 
 ## Recommendation
 
-**PASS for baseline instrumentation and the bounded 8-versus-16 capacity
-record. NOT evidence of cost reduction or real-Provider efficiency.** Keep
-this report as the locked deterministic baseline; do not close real-Provider
-validation until the owner-run matrix supplies pinned Provider/model, project
-revisions, timestamps, rubric outcomes, and Provider-reported usage when the
-Provider exposes it.
+**PASS for the Issue 8 instrumentation baseline and bounded 8-versus-16
+capacity record only. NOT a pass for answer quality, cost reduction, or
+real-Provider efficiency.** The downstream quality gate awaits the map,
+exploration-policy, and evidence-summary work in Issues 9–11, plus the
+real-Provider owner-run matrix with pinned Provider/model, project revisions,
+timestamps, rubric outcomes, and Provider-reported usage when available.
 
 ## Verification results
 
