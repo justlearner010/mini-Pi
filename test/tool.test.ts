@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, discoverRepositorySources, findCycles, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, discoverRepositorySources, findCycles, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -81,6 +81,76 @@ test("repository discovery never follows file or directory symlinks", async () =
   await symlink(join(rootDir, "real"), join(rootDir, "linked"));
   const result = await discoverRepositorySources(rootDir);
   assert.deepEqual(result.files.map((file) => file.path), ["inside.ts", "real/nested.ts"]);
+});
+
+test("repository index extracts syntax metadata without bodies or private methods", async () => {
+  const rootDir = await project({
+    "src/agent.ts": `import type { Tool } from "./tool.js";
+import OpenAI from "openai";
+export { helper } from "./helper.js";
+export interface AgentConfig { tools: Tool[] }
+export type Mode = "fast" | "safe";
+export enum State { Ready }
+export const secret = "DO_NOT_INDEX_INITIALIZER";
+export function createAgent(config: AgentConfig): Agent { return new Agent(config); }
+export default class Agent {
+  constructor(config: AgentConfig) {}
+  run(prompt: string): Promise<void> { return Promise.resolve(); }
+  protected prepare(): void {}
+  private leak(): string { return "DO_NOT_INDEX_BODY"; }
+}
+const lazy = import("./lazy.js");
+import alias from "@/alias.js";`,
+    "src/tool.ts": "export interface Tool { name: string }",
+    "src/helper.ts": "export const helper = 1"
+  });
+  const index = await buildRepositoryIndex(rootDir);
+  const agent = index.files.find((file) => file.path === "src/agent.ts")!;
+  assert(agent);
+  assert.deepEqual(agent.imports.map(({ specifier, kind, resolvedPath, exported }) => ({ specifier, kind, resolvedPath, exported })), [
+    { specifier: "./helper.js", kind: "relative", resolvedPath: "src/helper.ts", exported: true },
+    { specifier: "./lazy.js", kind: "dynamic", resolvedPath: undefined, exported: false },
+    { specifier: "./tool.js", kind: "relative", resolvedPath: "src/tool.ts", exported: false },
+    { specifier: "@/alias.js", kind: "alias", resolvedPath: undefined, exported: false },
+    { specifier: "openai", kind: "package", resolvedPath: undefined, exported: false }
+  ]);
+  const symbols = agent.symbols.map((symbol) => `${symbol.kind}:${symbol.name}`);
+  for (const expected of ["class:Agent", "method:constructor", "method:run", "function:createAgent", "interface:AgentConfig", "type:Mode", "enum:State", "variable:secret"]) assert(symbols.includes(expected), `${expected} missing from ${symbols.join(", ")}`);
+  const serialized = JSON.stringify(agent);
+  assert(!serialized.includes("DO_NOT_INDEX_INITIALIZER"));
+  assert(!serialized.includes("DO_NOT_INDEX_BODY"));
+  assert(!serialized.includes("prepare"));
+  assert(!serialized.includes("leak"));
+  assert.deepEqual(index.outgoing.get("src/agent.ts"), ["src/helper.ts", "src/tool.ts"]);
+  assert.deepEqual(index.incoming.get("src/tool.ts"), ["src/agent.ts"]);
+});
+
+test("repository index derives exact entry basenames and caps signatures", async () => {
+  const longParameters = Array.from({ length: 80 }, (_, index) => `value${index}: string`).join(", ");
+  const index = await buildRepositoryIndex(await project({
+    "src/index.ts": `export function long(${longParameters}): void {}`,
+    "src/application.ts": "export const application = true",
+    "src/cli.ts": "export const cli = true"
+  }));
+  assert.deepEqual(index.entryCandidates, ["src/cli.ts", "src/index.ts"]);
+  const signature = index.files.find((file) => file.path === "src/index.ts")!.symbols[0];
+  assert.equal(signature.signature.length, 240);
+  assert.equal(signature.signatureTruncated, true);
+  assert.deepEqual(signature.location, { line: 1, column: 1 });
+});
+
+test("repository index gives anonymous default declarations stable nonempty signatures", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "class.ts": "export default class {}",
+    "function.ts": "export default function (): void {}"
+  }));
+  const symbols = index.files.flatMap((file) => file.symbols);
+  const anonymousClass = symbols.find((item) => item.name === "default class")!;
+  const anonymousFunction = symbols.find((item) => item.name === "default function")!;
+  assert.match(anonymousClass.signature, /export default class/);
+  assert.match(anonymousFunction.signature, /export default function/);
+  assert.equal(anonymousClass.exported, true);
+  assert.equal(anonymousFunction.exported, true);
 });
 
 test("scan discovers README, manifests, supported files, and stable ordering", async () => {

@@ -118,6 +118,131 @@ export async function discoverRepositorySources(rootDir: string, limits: Reposit
   return { files, supportedFileCount: candidates.length, unsupportedLanguageFiles, nestedGitignoreFiles, inspectedBytes, skipped, truncated };
 }
 
+export interface SourceLocation { line: number; column: number; }
+export interface ImportInfo { specifier: string; kind: "relative" | "alias" | "package" | "dynamic"; resolvedPath?: string; exported: boolean; }
+export interface SymbolInfo {
+  name: string;
+  kind: "class" | "function" | "interface" | "type" | "enum" | "variable" | "method";
+  signature: string;
+  exported: boolean;
+  location: SourceLocation;
+  signatureTruncated: boolean;
+}
+export interface FileInfo { path: string; sourceKind: SourceKind; imports: ImportInfo[]; exports: string[]; symbols: SymbolInfo[]; parseDiagnostics: number; }
+export interface RepositoryIndex {
+  files: readonly FileInfo[];
+  incoming: ReadonlyMap<string, readonly string[]>;
+  outgoing: ReadonlyMap<string, readonly string[]>;
+  entryCandidates: readonly string[];
+  inspectedFileCount: number;
+  inspectedBytes: number;
+  skipped: Readonly<Record<string, number>>;
+  truncated: boolean;
+}
+
+function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  return !!ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === kind);
+}
+function declarationLocation(source: ts.SourceFile, node: ts.Node): SourceLocation {
+  const point = source.getLineAndCharacterOfPosition(node.getStart(source));
+  return { line: point.line + 1, column: point.character + 1 };
+}
+function cappedSignature(value: string): Pick<SymbolInfo, "signature" | "signatureTruncated"> {
+  const normalized = value.replace(/\s+/g, " ").trim().replace(/\s*\{$/, "");
+  return normalized.length <= 240 ? { signature: normalized, signatureTruncated: false } : { signature: `${normalized.slice(0, 239)}…`, signatureTruncated: true };
+}
+function declarationHeader(source: ts.SourceFile, node: ts.Node, body?: ts.Node): string {
+  return source.text.slice(node.getStart(source), body ? body.getStart(source) : node.getEnd()).trim();
+}
+function symbol(source: ts.SourceFile, node: ts.Node, kind: SymbolInfo["kind"], name: string, exported: boolean, signature: string): SymbolInfo {
+  return { name, kind, exported, location: declarationLocation(source, node), ...cappedSignature(signature) };
+}
+function scriptKind(kind: SourceKind): ts.ScriptKind {
+  if (kind === "tsx") return ts.ScriptKind.TSX;
+  if (kind === "jsx") return ts.ScriptKind.JSX;
+  if (kind === "js") return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS;
+}
+function importKind(specifier: string): ImportInfo["kind"] {
+  if (specifier.startsWith(".")) return "relative";
+  if (specifier.startsWith("@/") || specifier.startsWith("~/") || specifier.startsWith("#")) return "alias";
+  return "package";
+}
+
+async function indexFile(root: string, file: DiscoveredSource): Promise<FileInfo> {
+  const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, scriptKind(file.sourceKind));
+  const imports: ImportInfo[] = [], symbols: SymbolInfo[] = [], exportedNames: string[] = [];
+  for (const statement of source.statements) {
+    let specifier: string | undefined, exported = false;
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) specifier = statement.moduleSpecifier.text;
+    else if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) { specifier = statement.moduleSpecifier.text; exported = true; }
+    if (specifier) {
+      const kind = importKind(specifier);
+      const resolved = kind === "relative" ? await resolveImportPath(root, file.path, specifier) : {};
+      imports.push({ specifier, kind, ...(resolved.path ? { resolvedPath: resolved.path } : {}), exported });
+    }
+    if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) for (const item of statement.exportClause.elements) exportedNames.push(item.name.text);
+    const isExported = hasModifier(statement, ts.SyntaxKind.ExportKeyword) || hasModifier(statement, ts.SyntaxKind.DefaultKeyword);
+    if (ts.isClassDeclaration(statement)) {
+      const name = statement.name?.text ?? "default class";
+      symbols.push(symbol(source, statement, "class", name, isExported, source.text.slice(statement.getStart(source), statement.members.pos)));
+      if (isExported) {
+        exportedNames.push(name);
+        for (const member of statement.members) {
+          if (hasModifier(member, ts.SyntaxKind.PrivateKeyword) || hasModifier(member, ts.SyntaxKind.ProtectedKeyword)) continue;
+          if (ts.isConstructorDeclaration(member)) symbols.push(symbol(source, member, "method", "constructor", true, declarationHeader(source, member, member.body)));
+          else if (ts.isMethodDeclaration(member) && member.name) symbols.push(symbol(source, member, "method", member.name.getText(source), true, declarationHeader(source, member, member.body)));
+        }
+      }
+    } else if (ts.isFunctionDeclaration(statement)) {
+      const name = statement.name?.text ?? "default function";
+      symbols.push(symbol(source, statement, "function", name, isExported, declarationHeader(source, statement, statement.body)));
+      if (isExported) exportedNames.push(name);
+    } else if (ts.isInterfaceDeclaration(statement)) {
+      symbols.push(symbol(source, statement, "interface", statement.name.text, isExported, statement.getText(source)));
+      if (isExported) exportedNames.push(statement.name.text);
+    } else if (ts.isTypeAliasDeclaration(statement)) {
+      symbols.push(symbol(source, statement, "type", statement.name.text, isExported, statement.getText(source)));
+      if (isExported) exportedNames.push(statement.name.text);
+    } else if (ts.isEnumDeclaration(statement)) {
+      symbols.push(symbol(source, statement, "enum", statement.name.text, isExported, source.text.slice(statement.getStart(source), statement.members.pos)));
+      if (isExported) exportedNames.push(statement.name.text);
+    } else if (ts.isVariableStatement(statement)) {
+      const keyword = statement.declarationList.flags & ts.NodeFlags.Const ? "const" : statement.declarationList.flags & ts.NodeFlags.Let ? "let" : "var";
+      for (const declaration of statement.declarationList.declarations) if (ts.isIdentifier(declaration.name)) {
+        const signature = `${isExported ? "export " : ""}${keyword} ${declaration.name.text}${declaration.type ? `: ${declaration.type.getText(source)}` : ""}`;
+        symbols.push(symbol(source, declaration, "variable", declaration.name.text, isExported, signature));
+        if (isExported) exportedNames.push(declaration.name.text);
+      }
+    }
+  }
+  const visitDynamic = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0])) imports.push({ specifier: node.arguments[0].text, kind: "dynamic", exported: false });
+    ts.forEachChild(node, visitDynamic);
+  };
+  ts.forEachChild(source, visitDynamic);
+  imports.sort((left, right) => left.specifier.localeCompare(right.specifier) || left.kind.localeCompare(right.kind));
+  symbols.sort((left, right) => left.kind.localeCompare(right.kind) || left.name.localeCompare(right.name));
+  exportedNames.sort((left, right) => left.localeCompare(right));
+  return { path: file.path, sourceKind: file.sourceKind, imports, exports: [...new Set(exportedNames)], symbols, parseDiagnostics: (source as unknown as { parseDiagnostics: readonly unknown[] }).parseDiagnostics.length };
+}
+
+export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIndexLimits = REPOSITORY_INDEX_LIMITS): Promise<RepositoryIndex> {
+  const root = await realpath(rootDir);
+  const discovery = await discoverRepositorySources(root, limits);
+  const files = await Promise.all(discovery.files.map((file) => indexFile(root, file)));
+  const fileNames = new Set(files.map((file) => file.path));
+  const outgoing = new Map<string, string[]>(), incoming = new Map<string, string[]>();
+  for (const file of files) { outgoing.set(file.path, []); incoming.set(file.path, []); }
+  for (const file of files) for (const item of file.imports) if (item.resolvedPath && fileNames.has(item.resolvedPath)) {
+    if (!outgoing.get(file.path)!.includes(item.resolvedPath)) outgoing.get(file.path)!.push(item.resolvedPath);
+    if (!incoming.get(item.resolvedPath)!.includes(file.path)) incoming.get(item.resolvedPath)!.push(file.path);
+  }
+  for (const paths of [...outgoing.values(), ...incoming.values()]) paths.sort((left, right) => left.localeCompare(right));
+  const entryCandidates = files.map((file) => file.path).filter((path) => ["index", "main", "server", "app", "cli"].includes(path.replace(/\.d\.ts$|\.[^.]+$/i, "").split("/").at(-1) ?? "")).sort((left, right) => left.localeCompare(right));
+  return { files, incoming, outgoing, entryCandidates, inspectedFileCount: files.length, inspectedBytes: discovery.inspectedBytes, skipped: Object.freeze({ ...discovery.skipped, nestedGitignore: discovery.nestedGitignoreFiles, unsupportedLanguage: discovery.unsupportedLanguageFiles }), truncated: discovery.truncated };
+}
+
 type ScanContent = {
   scannedPath: string;
   readmePath: string | null;
