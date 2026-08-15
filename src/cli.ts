@@ -25,10 +25,11 @@ export type KeySource = "environment" | "credential-store";
 export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
 export interface RepositoryNavigation { index: RepositoryIndex; tools: Tool[]; mapFor(query: string, maxCharacters?: 4_000 | 8_000): RepoMapResult; }
 export const CREDENTIAL_SERVICE = "mini-Pi";
+export const AUTO_REPO_MAP_MAX_CHARACTERS = 4_000;
 export async function createRepositoryNavigation(rootDir: string): Promise<RepositoryNavigation | undefined> {
   try {
     const index = await buildRepositoryIndex(rootDir);
-    return { index, tools: [...tools, createQueryRepoMapTool(index)], mapFor: (query, maxCharacters = 8_000) => queryRepositoryIndex(index, query, { maxCharacters, limit: 8 }) };
+    return { index, tools: [...tools, createQueryRepoMapTool(index)], mapFor: (query, maxCharacters = AUTO_REPO_MAP_MAX_CHARACTERS) => queryRepositoryIndex(index, query, { maxCharacters, limit: 8 }) };
   } catch { return undefined; }
 }
 

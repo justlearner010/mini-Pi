@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  AUTO_REPO_MAP_MAX_CHARACTERS,
   completeInteractiveOptions,
   createRepositoryNavigation,
   createSystemCredentialStore,
@@ -37,12 +38,14 @@ test("one-shot prompt uses the plain CLI transcript and prints its answer once",
 });
 
 test("repository navigation builds a query Tool and supplies transient context", async () => {
+  assert.equal(AUTO_REPO_MAP_MAX_CHARACTERS, 4_000);
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-navigation-"));
   await mkdir(join(rootDir, "src"));
   await writeFile(join(rootDir, "src", "llm.ts"), "export interface ProviderConfig { model: string }");
   const navigation = await createRepositoryNavigation(rootDir);
   assert(navigation);
   assert(navigation.tools.some((tool) => tool.name === "query_repo_map"));
+  assert(navigation.mapFor("provider configuration").text.length <= 4_000);
   const calls: Array<{ prompt: string; options?: { transientContext?: string } }> = [];
   const agent = { async run(prompt: string, options?: { transientContext?: string }) { calls.push({ prompt, options }); return { answer: "done", messages: [], turns: 1 }; } };
   await runWithNavigation(agent, "provider configuration", navigation);
