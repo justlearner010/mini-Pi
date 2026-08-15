@@ -5,19 +5,18 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
-  buildProjectMap,
   completeInteractiveOptions,
+  createRepositoryNavigation,
   createSystemCredentialStore,
   debugEnabled,
   loginWithCredentialStore,
-  loadProjectMap,
   logoutFromCredentialStore,
-  mapSystemPrompt,
   exitCodeFor,
   getStartupSelection,
   parseArgs,
   readGlobalPreference,
   resolveApiKey,
+  runWithNavigation,
   runOneShot,
   selectAndSaveModel,
   saveGlobalPreference,
@@ -37,155 +36,33 @@ test("one-shot prompt uses the plain CLI transcript and prints its answer once",
   assert.equal((text.match(/final answer/g) ?? []).length, 1);
 });
 
-test("buildProjectMap renders a stable language-aware project overview", () => {
-  const map = buildProjectMap({
-    scannedPath: ".",
-    readmePath: "README.md",
-    manifestPaths: ["package.json", "tsconfig.json"],
-    sourceFiles: ["src/index.ts", "src/server.ts", "scripts/build.py"],
-    unsupportedFiles: ["assets/logo.svg"],
-    tree: "",
-    totalRelevantFiles: 6,
-    returnedFileCount: 6,
-    truncated: false
-  });
-
-  assert.deepEqual(map, {
-    status: "loaded",
-    totalFiles: 6,
-    entryCandidates: 2,
-    context: [
-      "Project map (6 relevant files)",
-      "README: README.md",
-      "Manifests: package.json, tsconfig.json",
-      "Source files: 3; unsupported files: 1",
-      "TS/JS source files: 2",
-      "Candidate TS/JS entry points: src/index.ts, src/server.ts",
-      "Directories: assets (1), scripts (1), src (2)",
-      "Languages: Python (1), TypeScript (2)",
-      "Candidate areas: assets (1), scripts (1), src (2)"
-    ].join("\n")
-  });
+test("repository navigation builds a query Tool and supplies transient context", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-navigation-"));
+  await mkdir(join(rootDir, "src"));
+  await writeFile(join(rootDir, "src", "llm.ts"), "export interface ProviderConfig { model: string }");
+  const navigation = await createRepositoryNavigation(rootDir);
+  assert(navigation);
+  assert(navigation.tools.some((tool) => tool.name === "query_repo_map"));
+  const calls: Array<{ prompt: string; options?: { transientContext?: string } }> = [];
+  const agent = { async run(prompt: string, options?: { transientContext?: string }) { calls.push({ prompt, options }); return { answer: "done", messages: [], turns: 1 }; } };
+  await runWithNavigation(agent, "provider configuration", navigation);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].options?.transientContext ?? "", /src\/llm\.ts/);
+  assert.match(calls[0].options?.transientContext ?? "", /source bodies not inspected/);
 });
 
-test("buildProjectMap retains the scan warning and omission marker within its character cap", () => {
-  const sourceFiles = Array.from({ length: 500 }, (_, index) => `packages/package-${String(index).padStart(3, "0")}/src/${"very-long-module-name-".repeat(4)}${index}.ts`);
-  const map = buildProjectMap({
-    scannedPath: ".",
-    readmePath: null,
-    manifestPaths: [],
-    sourceFiles,
-    unsupportedFiles: [],
-    tree: "",
-    totalRelevantFiles: 600,
-    returnedFileCount: 500,
-    truncated: true
-  });
-
-  assert.equal(map.status, "loaded");
-  if (map.status !== "loaded") return;
-  assert(map.context.length <= 4_000);
-  assert.match(map.context, /Scan truncated: 500 of 600 relevant files returned/);
-  assert(map.context.includes("Omitted map details due to 4000-character limit"));
-  assert(map.context.endsWith("\n") === false);
-  for (const line of map.context.split("\n")) assert(!line.endsWith("-"));
-});
-
-test("buildProjectMap reports the TS/JS source-file count", () => {
-  const map = buildProjectMap({
-    scannedPath: ".",
-    readmePath: null,
-    manifestPaths: [],
-    sourceFiles: ["src/app.ts", "src/view.tsx", "scripts/tool.js", "scripts/build.py"],
-    unsupportedFiles: [],
-    tree: "",
-    totalRelevantFiles: 4,
-    returnedFileCount: 4,
-    truncated: false
-  });
-
-  assert.equal(map.status, "loaded");
-  if (map.status !== "loaded") return;
-  assert.match(map.context, /TS\/JS source files: 3/);
-});
-
-test("buildProjectMap includes unsupported-language directories and languages", () => {
-  const map = buildProjectMap({
-    scannedPath: ".",
-    readmePath: null,
-    manifestPaths: [],
-    sourceFiles: [],
-    unsupportedFiles: ["service/app.py", "service/lib/db.py"],
-    tree: "",
-    totalRelevantFiles: 2,
-    returnedFileCount: 2,
-    truncated: false
-  });
-
-  assert.equal(map.status, "loaded");
-  if (map.status !== "loaded") return;
-  assert.match(map.context, /Directories: service \(2\), service\/lib \(1\)/);
-  assert.match(map.context, /Languages: Python \(2\)/);
-});
-
-test("buildProjectMap returns unavailable for malformed scan results", () => {
-  for (const value of [null, {}, { readmePath: null, manifestPaths: [], sourceFiles: [], unsupportedFiles: [], tree: "", totalRelevantFiles: 0, returnedFileCount: 0, truncated: "false" }, { scannedPath: ".", readmePath: null, manifestPaths: [1], sourceFiles: [], unsupportedFiles: [], tree: "", totalRelevantFiles: 0, returnedFileCount: 0, truncated: false }]) {
-    assert.deepEqual(buildProjectMap(value), { status: "unavailable", context: "" });
-  }
-});
-
-test("loadProjectMap scans the selected root once and composes map context once", async () => {
-  let calls = 0;
-  const map = await loadProjectMap("/project", {
-    async execute(args, context) {
-      calls += 1;
-      assert.deepEqual(args, {});
-      assert.deepEqual(context, { rootDir: "/project" });
-      return {
-        isError: false,
-        content: {
-          scannedPath: ".", readmePath: null, manifestPaths: [], sourceFiles: ["src/main.ts"], unsupportedFiles: [], tree: "", totalRelevantFiles: 1, returnedFileCount: 1, truncated: false
-        }
-      };
-    }
-  });
-
-  assert.equal(calls, 1);
-  assert.equal(map.status, "loaded");
-  assert.equal((mapSystemPrompt(map).match(/Project map/g) ?? []).length, 1);
-  assert(!mapSystemPrompt(map).includes('"sourceFiles"'));
-});
-
-test("loadProjectMap safely falls back when scanning fails", async () => {
-  for (const scan of [
-    { async execute() { throw new Error("scan failed"); } },
-    { async execute() { return { isError: true, content: "scan failed" }; } },
-    { async execute() { return { isError: false, content: { malformed: true } }; } }
-  ]) {
-    const map = await loadProjectMap("/project", scan as never);
-    assert.deepEqual(map, { status: "unavailable", context: "" });
-    assert.equal(mapSystemPrompt(map), SYSTEM_PROMPT);
-  }
-});
-
-test("buildProjectMap accepts the exact scan content shape and sorts derived facts", () => {
-  const map = buildProjectMap({
-    scannedPath: ".",
-    readmePath: "README.md",
-    manifestPaths: ["tsconfig.json", "package.json"],
-    sourceFiles: ["src/server.ts", "lib/main.ts", "src/index.ts"],
-    unsupportedFiles: [],
-    tree: "",
-    totalRelevantFiles: 6,
-    returnedFileCount: 6,
-    truncated: false
-  });
-
-  assert.equal(map.status, "loaded");
-  if (map.status !== "loaded") return;
-  assert.match(map.context, /Manifests: package\.json, tsconfig\.json/);
-  assert.match(map.context, /Candidate TS\/JS entry points: lib\/main\.ts, src\/index\.ts, src\/server\.ts/);
-  assert.match(map.context, /Directories: lib \(1\), src \(2\)/);
+test("repository navigation degrades safely and TUI status never receives map text", async () => {
+  assert.equal(await createRepositoryNavigation("/does-not-exist"), undefined);
+  const calls: unknown[] = [];
+  const agent = { async run(...args: unknown[]) { calls.push(args); return { answer: "done", messages: [], turns: 1 }; } };
+  await runWithNavigation(agent, "question", undefined);
+  assert.deepEqual(calls, [["question"]]);
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.repositoryIndexStatus({ available: true, indexedFiles: 42, skippedFiles: 3, truncated: true });
+  const text = output.join("");
+  assert.match(text, /Repository index · 42 files · 3 skipped · truncated/);
+  assert(!text.includes("REPO MAP") && !text.includes("signature"));
 });
 
 function approvalRequest(permission: ApprovalRequest["permission"], argumentsValue: unknown = { path: "secret.txt" }): ApprovalRequest {
@@ -574,6 +451,19 @@ test("TuiView defers a failure until agent_end finalizes activity and startTui d
   const text = output.join("");
   assert(text.indexOf("▸ activity · 1 tools") < text.indexOf("Error: broken"));
   assert.equal((text.match(/Error: broken/g) ?? []).length, 1);
+});
+
+test("startTui delegates user prompts to the navigation-aware run callback", async () => {
+  const inputs = ["where is provider configuration?", "/exit"];
+  const prompts: string[] = [];
+  const agent = { reset() {}, async run() { throw new Error("direct run must not be used"); } } as never;
+  const code = await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: () => undefined,
+    runAgent: async (_agent, prompt) => { prompts.push(prompt); return { answer: "src/llm.ts", messages: [], turns: 1 }; }
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(prompts, ["where is provider configuration?"]);
 });
 
 test("TuiView forwards MINI_PI_DEBUG to diagnostic formatting", () => {

@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { Agent, type AgentEvent, type RequestApproval } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
-import { scanProjectTool, tools, type Tool } from "./tool.js";
+import { buildRepositoryIndex, createQueryRepoMapTool, queryRepositoryIndex, tools, type RepoMapResult, type RepositoryIndex, type Tool } from "./tool.js";
 import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, TuiView, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
@@ -23,83 +23,18 @@ export interface CredentialStore {
 export type GlobalPreference = { provider: ProviderName; model: string };
 export type KeySource = "environment" | "credential-store";
 export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
+export interface RepositoryNavigation { index: RepositoryIndex; tools: Tool[]; mapFor(query: string, maxCharacters?: 4_000 | 8_000): RepoMapResult; }
 export const CREDENTIAL_SERVICE = "mini-Pi";
-export const PROJECT_MAP_MAX_CHARACTERS = 4_000;
-export type ProjectMap = { status: "loaded"; context: string; totalFiles: number; entryCandidates: number } | { status: "unavailable"; context: "" };
-type ScanProjectResult = { scannedPath: string; readmePath: string | null; manifestPaths: string[]; sourceFiles: string[]; unsupportedFiles: string[]; tree: string; totalRelevantFiles: number; returnedFileCount: number; truncated: boolean };
-
-function isScanProjectResult(value: unknown): value is ScanProjectResult {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const item = value as Record<string, unknown>;
-  const expected = ["scannedPath", "readmePath", "manifestPaths", "sourceFiles", "unsupportedFiles", "tree", "totalRelevantFiles", "returnedFileCount", "truncated"];
-  if (Object.keys(item).length !== expected.length || !expected.every((key) => Object.hasOwn(item, key))) return false;
-  return typeof item.scannedPath === "string"
-    && (item.readmePath === null || typeof item.readmePath === "string")
-    && [item.manifestPaths, item.sourceFiles, item.unsupportedFiles].every((paths) => Array.isArray(paths) && paths.every((path) => typeof path === "string"))
-    && typeof item.tree === "string"
-    && typeof item.totalRelevantFiles === "number" && Number.isSafeInteger(item.totalRelevantFiles) && item.totalRelevantFiles >= 0
-    && typeof item.returnedFileCount === "number" && Number.isSafeInteger(item.returnedFileCount) && item.returnedFileCount >= 0
-    && typeof item.truncated === "boolean";
-}
-
-function counted(values: string[]): string {
-  const counts = new Map<string, number>();
-  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
-  return [...counts].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([value, count]) => `${value} (${count})`).join(", ");
-}
-
-function languageFor(path: string): string | undefined {
-  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
-  return ({ ts: "TypeScript", tsx: "TSX", js: "JavaScript", jsx: "JSX", mjs: "JavaScript", cjs: "JavaScript", py: "Python", rs: "Rust", go: "Go", java: "Java", rb: "Ruby", php: "PHP", cs: "C#", cpp: "C++", cc: "C++", c: "C", h: "C/C++", swift: "Swift", kt: "Kotlin", kts: "Kotlin", sh: "Shell", bash: "Shell", zsh: "Shell", sql: "SQL" } as Record<string, string>)[extension];
-}
-
-function directoriesFor(path: string): string[] {
-  const directories: string[] = [];
-  for (let directory = dirname(path); directory !== "."; directory = dirname(directory)) directories.push(directory);
-  return directories;
-}
-
-export function buildProjectMap(value: unknown): ProjectMap {
-  if (!isScanProjectResult(value)) return { status: "unavailable", context: "" };
-  const sourceFiles = [...value.sourceFiles].sort();
-  const tsJsSourceFileCount = sourceFiles.filter((path) => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(path)).length;
-  const entries = sourceFiles.filter((path) => /(?:^|\/)(?:index|main|server|app|cli)\.(?:[cm]?[jt]sx?)$/i.test(path));
-  const sourceDirectories = [...sourceFiles, ...value.unsupportedFiles].flatMap(directoriesFor);
-  const languages = [...sourceFiles, ...value.unsupportedFiles].map(languageFor).filter((language): language is string => Boolean(language));
-  const lines = [
-    `Project map (${value.totalRelevantFiles} relevant files)`,
-    value.truncated ? `Scan truncated: ${value.returnedFileCount} of ${value.totalRelevantFiles} relevant files returned` : undefined,
-    value.readmePath ? `README: ${value.readmePath}` : undefined,
-    value.manifestPaths.length ? `Manifests: ${[...value.manifestPaths].sort().join(", ")}` : undefined,
-    `Source files: ${sourceFiles.length}; unsupported files: ${value.unsupportedFiles.length}`,
-    `TS/JS source files: ${tsJsSourceFileCount}`,
-    entries.length ? `Candidate TS/JS entry points: ${entries.join(", ")}` : undefined,
-    sourceDirectories.length ? `Directories: ${counted(sourceDirectories)}` : undefined,
-    languages.length ? `Languages: ${counted(languages)}` : undefined,
-    sourceDirectories.length ? `Candidate areas: ${counted(sourceDirectories)}` : undefined
-  ].filter((line): line is string => Boolean(line));
-  const omission = `Omitted map details due to ${PROJECT_MAP_MAX_CHARACTERS}-character limit`;
-  const context: string[] = [];
-  let omitted = false;
-  for (const line of lines) {
-    const length = context.length ? context.join("\n").length + 1 + line.length : line.length;
-    if (length <= PROJECT_MAP_MAX_CHARACTERS - omission.length - 1) context.push(line);
-    else omitted = true;
-  }
-  return { status: "loaded", context: omitted ? [...context, omission].join("\n") : lines.join("\n"), totalFiles: value.totalRelevantFiles, entryCandidates: entries.length };
-}
-
-export async function loadProjectMap(rootDir: string, scan: Pick<Tool, "execute"> = scanProjectTool): Promise<ProjectMap> {
+export async function createRepositoryNavigation(rootDir: string): Promise<RepositoryNavigation | undefined> {
   try {
-    const result = await scan.execute({}, { rootDir });
-    return result.isError ? { status: "unavailable", context: "" } : buildProjectMap(result.content);
-  } catch {
-    return { status: "unavailable", context: "" };
-  }
+    const index = await buildRepositoryIndex(rootDir);
+    return { index, tools: [...tools, createQueryRepoMapTool(index)], mapFor: (query, maxCharacters = 8_000) => queryRepositoryIndex(index, query, { maxCharacters, limit: 8 }) };
+  } catch { return undefined; }
 }
 
-export function mapSystemPrompt(map: ProjectMap): string {
-  return map.status === "loaded" ? `${SYSTEM_PROMPT}\n\n${map.context}` : SYSTEM_PROMPT;
+export function runWithNavigation(agent: Pick<Agent, "run">, prompt: string, navigation?: RepositoryNavigation): ReturnType<Agent["run"]> {
+  const transientContext = navigation?.mapFor(prompt).text;
+  return transientContext ? agent.run(prompt, { transientContext }) : agent.run(prompt);
 }
 export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
 const require = createRequire(import.meta.url);
@@ -264,6 +199,12 @@ If a tool result is truncated or incomplete, say so and narrow the
 analysis scope when possible.
 
 Answer in the user's language.
+If current-run repository navigation context identifies a plausible candidate,
+read that candidate instead of scanning the whole project. Call query_repo_map
+once with a more precise query only when candidates are absent, ambiguous, or
+conflict with inspected evidence. Repo Map metadata is navigation evidence,
+not proof of function-body behavior.
+
 For full-project analysis, include:
 - a short project overview;
 - the directory structure;
@@ -271,12 +212,12 @@ For full-project analysis, include:
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
 function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
-function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, systemPrompt: string, onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
-  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt, onEvent, requestApproval, messages });
+function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, agentTools: Tool[], onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
+  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools: agentTools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
 }
 
-export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log): Promise<number> {
-  try { write((await agent.run(prompt)).answer); return 0; }
+export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log, navigation?: RepositoryNavigation): Promise<number> {
+  try { write((await runWithNavigation(agent, prompt, navigation)).answer); return 0; }
   catch { return 1; }
 }
 
@@ -309,23 +250,24 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
   const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
-  const projectMap = await loadProjectMap(valid.rootDir!);
-  const systemPrompt = mapSystemPrompt(projectMap);
+  const navigation = await createRepositoryNavigation(valid.rootDir!);
+  const agentTools = navigation?.tools ?? tools;
   if (valid.prompt) {
-    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, systemPrompt, (event) => {
+    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, agentTools, (event) => {
       const text = formatEvent(event, debugEnabled(env));
       if (text) console.log(text);
     }, requestApproval);
-    return runOneShot(agent, valid.prompt);
+    return runOneShot(agent, valid.prompt, console.log, navigation);
   }
   const view = new TuiView({ write: (text) => process.stdout.write(text), provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, systemPrompt, view.onEvent.bind(view), requestApproval, history) });
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, agentTools, view.onEvent.bind(view), requestApproval, history) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
-  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {
+  const skippedFiles = navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0;
+  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model, repositoryIndexStatus: { available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles, truncated: navigation?.index.truncated ?? false } }, {
     login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
     model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.agent.history()); },
     logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference)
-  }, {}, view);
+  }, { runAgent: (agent, prompt) => runWithNavigation(agent, prompt, navigation) }, view);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) run().then((code) => { process.exitCode = code; });
