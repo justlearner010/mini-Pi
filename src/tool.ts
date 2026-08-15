@@ -1,6 +1,7 @@
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { builtinModules } from "node:module";
+import ignore from "ignore";
 import ts from "typescript";
 
 export interface ToolContext {
@@ -35,6 +36,87 @@ const MAX_DEPENDENCY_CYCLES = 500;
 const MAX_DEPENDENCY_CYCLE_STEPS = 100_000;
 const RESOLVABLE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 const BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, "")));
+
+export interface RepositoryIndexLimits {
+  maxFiles: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+}
+
+export const REPOSITORY_INDEX_LIMITS: RepositoryIndexLimits = {
+  maxFiles: 5_000,
+  maxFileBytes: 512 * 1024,
+  maxTotalBytes: 50 * 1024 * 1024
+};
+
+export type SourceKind = "ts" | "tsx" | "js" | "jsx" | "dts";
+export interface DiscoveredSource { path: string; sourceKind: SourceKind; bytes: number; text: string; }
+export interface RepositoryDiscovery {
+  files: DiscoveredSource[];
+  supportedFileCount: number;
+  unsupportedLanguageFiles: number;
+  nestedGitignoreFiles: number;
+  inspectedBytes: number;
+  skipped: { fileLimit: number; fileTooLarge: number; totalBytes: number; readError: number };
+  truncated: boolean;
+}
+
+function sourceKind(path: string): SourceKind | undefined {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".d.ts")) return "dts";
+  if (lower.endsWith(".tsx")) return "tsx";
+  if (lower.endsWith(".ts")) return "ts";
+  if (lower.endsWith(".jsx")) return "jsx";
+  if (lower.endsWith(".js")) return "js";
+  return undefined;
+}
+
+export async function discoverRepositorySources(rootDir: string, limits: RepositoryIndexLimits = REPOSITORY_INDEX_LIMITS): Promise<RepositoryDiscovery> {
+  if (![limits.maxFiles, limits.maxFileBytes, limits.maxTotalBytes].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error("Repository index limits must be positive integers");
+  const root = await realpath(rootDir);
+  const matcher = ignore();
+  try { matcher.add(await readFile(resolve(root, ".gitignore"), "utf8")); } catch { /* optional root ignore */ }
+  const candidates: Array<{ path: string; absolutePath: string; sourceKind: SourceKind }> = [];
+  let unsupportedLanguageFiles = 0, nestedGitignoreFiles = 0;
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const absolutePath = resolve(directory, entry.name);
+      const path = relativePath(root, absolutePath);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".") || IGNORED_DIRECTORIES.has(entry.name) || matcher.ignores(`${path}/`)) continue;
+        await visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name === ".gitignore" && directory !== root) nestedGitignoreFiles += 1;
+      if (matcher.ignores(path)) continue;
+      const kind = sourceKind(path);
+      if (kind) candidates.push({ path, absolutePath, sourceKind: kind });
+      else if (UNSUPPORTED_SOURCE_EXTENSIONS.has(extname(path).toLowerCase())) unsupportedLanguageFiles += 1;
+    }
+  };
+  await visit(root);
+  candidates.sort((left, right) => left.path.localeCompare(right.path));
+  const files: DiscoveredSource[] = [];
+  const skipped = { fileLimit: 0, fileTooLarge: 0, totalBytes: 0, readError: 0 };
+  let inspectedBytes = 0;
+  for (const candidate of candidates) {
+    if (files.length === limits.maxFiles) { skipped.fileLimit += 1; continue; }
+    try {
+      const bytes = await readFile(candidate.absolutePath);
+      if (bytes.byteLength > limits.maxFileBytes) { skipped.fileTooLarge += 1; continue; }
+      if (inspectedBytes + bytes.byteLength > limits.maxTotalBytes) { skipped.totalBytes += 1; continue; }
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      files.push({ path: candidate.path, sourceKind: candidate.sourceKind, bytes: bytes.byteLength, text });
+      inspectedBytes += bytes.byteLength;
+    } catch { skipped.readError += 1; }
+  }
+  const truncated = nestedGitignoreFiles > 0 || Object.values(skipped).some((value) => value > 0);
+  return { files, supportedFileCount: candidates.length, unsupportedLanguageFiles, nestedGitignoreFiles, inspectedBytes, skipped, truncated };
+}
 
 type ScanContent = {
   scannedPath: string;

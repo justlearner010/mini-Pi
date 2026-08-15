@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, findCycles, readFileTool, scanProjectTool } from "../src/tool.js";
+import { analyzeDependenciesTool, discoverRepositorySources, findCycles, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -28,6 +28,60 @@ async function analyze(rootDir: string, args: Record<string, unknown> = {}) {
   assert.equal(result.isError, false);
   return result.content as Record<string, unknown>;
 }
+
+test("repository discovery honors gitignore, hard excludes, and source kinds", async () => {
+  const rootDir = await project({
+    ".gitignore": "ignored/*\n!ignored/keep.ts\n*.generated.ts\n",
+    "src/a.ts": "export const a = 1",
+    "src/view.tsx": "export const View = () => null",
+    "src/legacy.js": "export const legacy = 1",
+    "src/widget.jsx": "export const Widget = () => null",
+    "types/api.d.ts": "export interface Api {}",
+    "ignored/drop.ts": "export const drop = 1",
+    "ignored/keep.ts": "export const keep = 1",
+    "src/skip.generated.ts": "export const generated = 1",
+    "node_modules/pkg/index.ts": "export const dependency = 1",
+    "dist/out.js": "export const built = 1",
+    ".cache/hidden.ts": "export const hidden = 1",
+    "script.py": "print('unsupported')"
+  });
+  const result = await discoverRepositorySources(rootDir);
+  assert.deepEqual(result.files.map((file) => [file.path, file.sourceKind]), [
+    ["ignored/keep.ts", "ts"], ["src/a.ts", "ts"], ["src/legacy.js", "js"],
+    ["src/view.tsx", "tsx"], ["src/widget.jsx", "jsx"], ["types/api.d.ts", "dts"]
+  ]);
+  assert.equal(result.unsupportedLanguageFiles, 1);
+  assert.equal(result.truncated, false);
+});
+
+test("repository discovery records file-size and total-byte bounds", async () => {
+  assert.deepEqual(REPOSITORY_INDEX_LIMITS, { maxFiles: 5_000, maxFileBytes: 512 * 1024, maxTotalBytes: 50 * 1024 * 1024 });
+  const limits: RepositoryIndexLimits = { maxFiles: 10, maxFileBytes: 4, maxTotalBytes: 6 };
+  const result = await discoverRepositorySources(await project({ "a.ts": "1234", "b.ts": "56", "c.ts": "7", "large.ts": "12345" }), limits);
+  assert.deepEqual(result.files.map((file) => file.path), ["a.ts", "b.ts"]);
+  assert.deepEqual(result.skipped, { fileLimit: 0, fileTooLarge: 1, totalBytes: 1, readError: 0 });
+  assert.equal(result.inspectedBytes, 6);
+  assert.equal(result.truncated, true);
+});
+
+test("repository discovery records the file-count boundary and nested gitignore scope", async () => {
+  const result = await discoverRepositorySources(await project({
+    "a.ts": "a", "b.ts": "b", "c.ts": "c", "nested/.gitignore": "ignored.ts\n", "nested/ignored.ts": "ignored"
+  }), { maxFiles: 2, maxFileBytes: 10, maxTotalBytes: 20 });
+  assert.deepEqual(result.files.map((file) => file.path), ["a.ts", "b.ts"]);
+  assert.equal(result.skipped.fileLimit, 2);
+  assert.equal(result.nestedGitignoreFiles, 1);
+  assert.equal(result.truncated, true);
+});
+
+test("repository discovery never follows file or directory symlinks", async () => {
+  const outside = await project({ "secret.ts": "secret" });
+  const rootDir = await project({ "inside.ts": "inside", "real/nested.ts": "nested" });
+  await symlink(join(outside, "secret.ts"), join(rootDir, "outside.ts"));
+  await symlink(join(rootDir, "real"), join(rootDir, "linked"));
+  const result = await discoverRepositorySources(rootDir);
+  assert.deepEqual(result.files.map((file) => file.path), ["inside.ts", "real/nested.ts"]);
+});
 
 test("scan discovers README, manifests, supported files, and stable ordering", async () => {
   const rootDir = await project({
