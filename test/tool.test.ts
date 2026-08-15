@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, buildRepositoryIndex, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, createQueryRepoMapTool, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -195,6 +195,27 @@ test("queryRepositoryIndex expands one hop, falls back to entries, and caps comp
   const fallback = queryRepositoryIndex(index, "unrelated mystery", { maxCharacters: 8_000, limit: 1 });
   assert.equal(fallback.candidates[0].path, "src/index.ts");
   assert(fallback.candidates[0].reasons.includes("fallback candidate"));
+});
+
+test("query_repo_map is SAFE, strict, bounded, and index-only", async () => {
+  const index = await buildRepositoryIndex(await project({ "src/llm.ts": "export interface ProviderConfig { model: string }" }));
+  const tool = createQueryRepoMapTool(index);
+  assert.equal(tool.name, "query_repo_map");
+  assert.equal(tool.permission, "SAFE");
+  assert.deepEqual(tool.parameters, {
+    type: "object",
+    properties: { query: { type: "string", minLength: 1 }, limit: { type: "integer", minimum: 1, maximum: 8 } },
+    required: ["query"],
+    additionalProperties: false
+  });
+  const result = await tool.execute({ query: "provider", limit: 3 }, { rootDir: "/does-not-exist" });
+  assert.equal(result.isError, false);
+  assert((result.content as RepoMapResult).text.length <= 8_000);
+  assert.equal(typeof result.historyContent, "string");
+  assert([...result.historyContent!].length <= 512);
+  for (const args of [{}, { query: "" }, { query: "x", limit: 0 }, { query: "x", limit: 9 }, { query: "x", limit: 1.5 }, { query: "x", extra: true }, []]) {
+    assert.equal((await tool.execute(args, { rootDir: "/does-not-exist" })).isError, true);
+  }
 });
 
 test("scan discovers README, manifests, supported files, and stable ordering", async () => {

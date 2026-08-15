@@ -73,6 +73,7 @@ export class Agent {
 
   async run(prompt: string): Promise<AgentResult> {
     const start = this.messages.length;
+    const historyReplacements = new Map<string, string>();
     this.emit({ type: "agent_start", prompt });
     this.messages.push({ role: "user", content: prompt });
     let turns = 0;
@@ -90,11 +91,18 @@ export class Agent {
         this.messages.push(message);
         if (!message.toolCalls.length) {
           const answer = message.content ?? "";
+          for (const item of this.messages) if (item.role === "tool") {
+            const replacement = historyReplacements.get(item.toolCallId);
+            if (replacement !== undefined) item.content = replacement;
+          }
           const result = { answer, messages: structuredClone(this.messages), turns };
           this.emit({ type: "agent_end", answer, turns });
           return result;
         }
-        for (const call of message.toolCalls) await this.execute(call, turn);
+        for (const call of message.toolCalls) {
+          const replacement = await this.execute(call, turn);
+          if (replacement !== undefined) historyReplacements.set(call.id, replacement);
+        }
       }
     } catch (error) {
       this.messages.splice(start);
@@ -106,9 +114,10 @@ export class Agent {
     }
   }
 
-  private async execute(call: ToolCall, turn: number): Promise<void> {
+  private async execute(call: ToolCall, turn: number): Promise<string | undefined> {
     const tool = this.tools.find((item) => item.name === call.name);
     let result: string, isError: boolean, message: string;
+    let historyContent: string | undefined;
     try {
       if (!tool) throw new Error(`Unknown tool: ${call.name}`);
       let args: unknown;
@@ -134,6 +143,7 @@ export class Agent {
       isError = output.isError;
       result = output.isError ? `Tool error: ${content(output.content)}` : content(output.content);
       message = output.isError ? summary(output.content) : "completed";
+      if (typeof output.historyContent === "string") historyContent = [...output.historyContent].slice(0, 512).join("");
     } catch (error) {
       isError = true;
       message = error instanceof Error ? error.message : "Tool failed";
@@ -141,6 +151,7 @@ export class Agent {
     }
     this.messages.push({ role: "tool", toolCallId: call.id, content: result });
     this.emit({ type: "tool_end", turn, toolCallId: call.id, toolName: call.name, isError, message: summary(message) });
+    return historyContent;
   }
 
   private emit(event: AgentEvent): void { this.onEvent?.(event); }

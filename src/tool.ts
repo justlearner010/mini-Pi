@@ -11,6 +11,7 @@ export interface ToolContext {
 export interface ToolResult {
   content: unknown;
   isError: boolean;
+  historyContent?: string;
 }
 
 export type ToolPermission = "SAFE" | "SENSITIVE" | "DESTRUCTIVE";
@@ -311,6 +312,39 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
   let text = [...kept, ...scope()].join("\n");
   while (text.length > maxCharacters && kept.length) { kept.pop(); mapTruncated = true; text = [...kept, ...scope()].join("\n"); }
   return { query, candidates, text, mapTruncated };
+}
+
+function capCodePoints(value: string, limit: number): string { return [...value].slice(0, limit).join(""); }
+
+export function createQueryRepoMapTool(index: RepositoryIndex): Tool {
+  return {
+    name: "query_repo_map",
+    description: "Find candidate TypeScript and JavaScript files and declarations in the prebuilt repository index.",
+    permission: "SAFE",
+    reason: "Only queries bounded metadata already read from the configured project root.",
+    risk: "low",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", minLength: 1 }, limit: { type: "integer", minimum: 1, maximum: 8 } },
+      required: ["query"],
+      additionalProperties: false
+    },
+    async execute(args) {
+      try {
+        if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some((key) => key !== "query" && key !== "limit")) throw new Error("Arguments must contain only query and limit");
+        const input = args as { query?: unknown; limit?: unknown };
+        if (typeof input.query !== "string" || !input.query.trim()) throw new Error("Query must be a nonempty string");
+        const limit = input.limit ?? 8;
+        if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 8) throw new Error("Limit must be an integer from 1 to 8");
+        const content = queryRepositoryIndex(index, input.query, { maxCharacters: 8_000, limit: limit as number });
+        const paths = content.candidates.map((candidate) => candidate.path).join(", ") || "none";
+        const historyContent = capCodePoints(`Repo map candidates: ${paths}; index truncated: ${index.truncated ? "yes" : "no"}; map truncated: ${content.mapTruncated ? "yes" : "no"}`, 512);
+        return { content, historyContent, isError: false };
+      } catch (error) {
+        return { content: error instanceof Error ? error.message : "Unable to query repository map", isError: true };
+      }
+    }
+  };
 }
 
 type ScanContent = {
