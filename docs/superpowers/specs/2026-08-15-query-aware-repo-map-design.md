@@ -213,6 +213,11 @@ Anonymous/default declarations receive a stable display name such as
 abort the whole index: the file retains facts recoverable from its AST and its
 diagnostic count is reported.
 
+Entry candidates are supported source files whose basename without extension
+is exactly `index`, `main`, `server`, `app`, or `cli`, ordered lexically. V1 does
+not read manifest scripts to create additional entry candidates; manifest-aware
+entry inference remains ordinary Agent evidence through `read_file`.
+
 ## Candidate selection
 
 Query ranking is deterministic and lexical, not semantic search. The renderer
