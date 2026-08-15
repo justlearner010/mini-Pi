@@ -311,6 +311,30 @@ test("Tool history breadcrumbs cap Unicode safely and ignore malformed replaceme
   }
 });
 
+test("transient context reaches every request but never persistent history", async () => {
+  const fake = fakeLLM([response(null, [{ id: "read", name: "noop", arguments: "{}" }]), response("done"), response("second")]);
+  const agent = new Agent({ llm: fake.llm, tools: [tool("noop", async () => ({ content: "ok", isError: false }))], systemPrompt: "rules", rootDir: "/project" });
+  const result = await agent.run("find provider", { transientContext: "REPO MAP\nsrc/llm.ts" });
+  for (const request of fake.requests.slice(0, 2)) assert.deepEqual(request.slice(0, 2), [
+    { role: "system", content: "rules" },
+    { role: "system", content: "Current-run repository navigation context:\nREPO MAP\nsrc/llm.ts" }
+  ]);
+  assert(!JSON.stringify(result.messages).includes("REPO MAP"));
+  assert(!JSON.stringify(agent.history()).includes("REPO MAP"));
+  await agent.run("second question", { transientContext: "SECOND MAP" });
+  assert(JSON.stringify(fake.requests[2]).includes("SECOND MAP"));
+  assert(!JSON.stringify(fake.requests[2]).includes("REPO MAP"));
+});
+
+test("transient context ignores whitespace and rejects content above its hard limit", async () => {
+  const fake = fakeLLM([response("plain")]);
+  const agent = new Agent({ llm: fake.llm, tools: [], systemPrompt: "rules", rootDir: "/project" });
+  await agent.run("plain", { transientContext: "  \n" });
+  assert.deepEqual(fake.requests[0], [{ role: "system", content: "rules" }, { role: "user", content: "plain" }]);
+  await assert.rejects(() => agent.run("too large", { transientContext: "x".repeat(8_001) }), /8,000/);
+  assert(!agent.history().some((message) => message.content === "too large"));
+});
+
 test("transports a safe provider diagnostic through the model error event", async () => {
   const failure = new ProviderDiagnostic({ provider: "deepseek", level: "warning", kind: "rate_limit", message: "DeepSeek 请求受限", reason: "当前请求被限流、余额或并发限制。", advice: "稍后重试，或切换模型 / Provider。", status: 429, code: "rate_limit", requestId: "req_2" });
   const fake = fakeLLM([failure]);

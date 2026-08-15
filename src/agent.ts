@@ -35,6 +35,7 @@ export interface AgentConfig {
 }
 export const DEFAULT_MAX_TURNS = 16;
 export interface AgentResult { answer: string; messages: Message[]; turns: number; }
+export interface AgentRunOptions { transientContext?: string; }
 
 function content(value: unknown): string {
   if (value == null) return "";
@@ -71,7 +72,9 @@ export class Agent {
   reset(): void { this.messages = [{ role: "system", content: this.systemPrompt }]; }
   history(): Message[] { return structuredClone(this.messages); }
 
-  async run(prompt: string): Promise<AgentResult> {
+  async run(prompt: string, options: AgentRunOptions = {}): Promise<AgentResult> {
+    const transientContext = options.transientContext?.trim() || undefined;
+    if (transientContext && transientContext.length > 8_000) throw new Error("Transient context exceeds 8,000 characters");
     const start = this.messages.length;
     const historyReplacements = new Map<string, string>();
     this.emit({ type: "agent_start", prompt });
@@ -83,7 +86,7 @@ export class Agent {
         const turn = turns + 1;
         this.emit({ type: "model_start", turn });
         let response;
-        try { response = await this.llm.generate(this.messages, this.tools); }
+        try { response = await this.llm.generate(this.requestMessages(transientContext), this.tools); }
         catch (error) { throw error instanceof ProviderDiagnostic ? { stage: "model", turn, message: error.message, diagnostic: error } : { stage: "model", message: "Model request failed" }; }
         turns += 1;
         const message = response.message;
@@ -112,6 +115,12 @@ export class Agent {
       this.emit({ type: "agent_end", answer: "", turns });
       throw failure.diagnostic instanceof ProviderDiagnostic ? failure.diagnostic : new Error(message);
     }
+  }
+
+  private requestMessages(transientContext?: string): Message[] {
+    const messages = structuredClone(this.messages);
+    if (transientContext) messages.splice(1, 0, { role: "system", content: `Current-run repository navigation context:\n${transientContext}` });
+    return messages;
   }
 
   private async execute(call: ToolCall, turn: number): Promise<string | undefined> {
