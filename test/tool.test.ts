@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, buildRepositoryIndex, discoverRepositorySources, findCycles, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -151,6 +151,50 @@ test("repository index gives anonymous default declarations stable nonempty sign
   assert.match(anonymousFunction.signature, /export default function/);
   assert.equal(anonymousClass.exported, true);
   assert.equal(anonymousFunction.exported, true);
+});
+
+test("queryRepositoryIndex locates the five declared navigation targets", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "src/cli.ts": `import { Agent } from "./agent.js"; import { createLLM } from "./llm.js"; export function runCli(): void {}`,
+    "src/agent.ts": `import type { Tool } from "./tool.js"; import type { LLMClient } from "./llm.js"; export class Agent { run(prompt: string): Promise<void> { return Promise.resolve(); } }`,
+    "src/tool.ts": `export interface Tool { execute(args: unknown): Promise<void> } export class ToolRegistry { execute(name: string): Promise<void> { return Promise.resolve(); } }`,
+    "src/llm.ts": `export interface LLMProviderConfig { provider: string } export interface LLMClient {} export function createLLM(config: LLMProviderConfig): LLMClient { return {}; }`
+  }));
+  const cases = [
+    ["Where is CLI handling implemented?", "src/cli.ts"],
+    ["Which module defines the LLM provider?", "src/llm.ts"],
+    ["Where is tool execution handled?", "src/tool.ts"],
+    ["Which modules depend on Agent?", "src/agent.ts"],
+    ["Where should I inspect provider configuration?", "src/llm.ts"]
+  ] as const;
+  let top1 = 0;
+  for (const [query, expected] of cases) {
+    const result = queryRepositoryIndex(index, query, { maxCharacters: 8_000, limit: 8 });
+    assert(result.candidates.slice(0, 3).some((candidate) => candidate.path === expected), `${expected} missing for ${query}`);
+    if (result.candidates[0]?.path === expected) top1 += 1;
+    assert.match(result.text, /REPO MAP/);
+    assert.match(result.text, /source bodies not inspected/);
+    assert.match(result.text, /index truncated: no/);
+    assert.match(result.text, /map truncated: no/);
+  }
+  assert(top1 >= 4, `only ${top1}/5 Top-1 matches`);
+});
+
+test("queryRepositoryIndex expands one hop, falls back to entries, and caps complete lines", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "src/index.ts": `import { target } from "./target.js"; export const start = target`,
+    "src/target.ts": `export function target(): void {}`,
+    ...Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`src/neighbor-${String(index).padStart(3, "0")}.ts`, `import { target } from "./target.js"; export const n${index} = target`]))
+  }));
+  const matched = queryRepositoryIndex(index, "target", { maxCharacters: 4_000, limit: 8 });
+  assert.equal(matched.candidates[0].path, "src/target.ts");
+  assert(matched.candidates.slice(1).some((candidate) => candidate.path === "src/index.ts"));
+  assert(matched.text.length <= 4_000);
+  assert.match(matched.text, /map truncated: yes/);
+  assert(!matched.text.endsWith("src/"));
+  const fallback = queryRepositoryIndex(index, "unrelated mystery", { maxCharacters: 8_000, limit: 1 });
+  assert.equal(fallback.candidates[0].path, "src/index.ts");
+  assert(fallback.candidates[0].reasons.includes("fallback candidate"));
 });
 
 test("scan discovers README, manifests, supported files, and stable ordering", async () => {

@@ -243,6 +243,76 @@ export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIn
   return { files, incoming, outgoing, entryCandidates, inspectedFileCount: files.length, inspectedBytes: discovery.inspectedBytes, skipped: Object.freeze({ ...discovery.skipped, nestedGitignore: discovery.nestedGitignoreFiles, unsupportedLanguage: discovery.unsupportedLanguageFiles }), truncated: discovery.truncated };
 }
 
+export interface RepoMapCandidate { path: string; reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[]; }
+export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; mapTruncated: boolean; }
+
+function tokens(value: string): string[] {
+  return value.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+function overlap(left: Set<string>, right: Set<string>): number {
+  let count = 0;
+  for (const item of left) if (right.has(item)) count += 1;
+  return count;
+}
+
+export function queryRepositoryIndex(index: RepositoryIndex, query: string, options: { maxCharacters?: 4_000 | 8_000; limit?: number } = {}): RepoMapResult {
+  const maxCharacters = options.maxCharacters ?? 8_000, limit = options.limit ?? 8;
+  if (!query.trim() || !Number.isInteger(limit) || limit < 1 || limit > 8) throw new Error("Repo Map query and limit are invalid");
+  const queryTokens = new Set(tokens(query));
+  const ranked = index.files.map((file) => {
+    const symbolTokens = new Set(file.symbols.flatMap((item) => tokens(item.name)).concat(file.exports.flatMap(tokens)));
+    const pathTokens = new Set(tokens(file.path));
+    const exact = file.symbols.some((item) => queryTokens.has(item.name.toLowerCase())) || file.exports.some((item) => queryTokens.has(item.toLowerCase()));
+    const symbolMatches = overlap(queryTokens, symbolTokens), pathMatches = overlap(queryTokens, pathTokens);
+    return { file, score: [Number(exact), symbolMatches, pathMatches, Number(index.entryCandidates.includes(file.path)), index.incoming.get(file.path)?.length ?? 0] as const };
+  });
+  ranked.sort((left, right) => {
+    for (let index = 0; index < left.score.length; index += 1) if (left.score[index] !== right.score[index]) return right.score[index] - left.score[index];
+    return left.file.path.localeCompare(right.file.path);
+  });
+  const seeds = ranked.filter((item) => item.score[0] || item.score[1] || item.score[2]);
+  const selected: Array<{ file: FileInfo; reasons: string[] }> = [];
+  if (!seeds.length) {
+    for (const path of index.entryCandidates) {
+      const file = index.files.find((item) => item.path === path);
+      if (file) selected.push({ file, reasons: ["fallback candidate"] });
+    }
+  } else {
+    for (const item of seeds) {
+      const reasons = [item.score[0] ? "exact symbol match" : "", item.score[1] ? "symbol match" : "", item.score[2] ? "path match" : ""].filter(Boolean);
+      selected.push({ file: item.file, reasons });
+    }
+    const seedPaths = new Set(selected.map((item) => item.file.path));
+    const neighbors = new Set<string>();
+    for (const path of seedPaths) for (const neighbor of [...(index.incoming.get(path) ?? []), ...(index.outgoing.get(path) ?? [])]) if (!seedPaths.has(neighbor)) neighbors.add(neighbor);
+    for (const path of [...neighbors].sort((left, right) => left.localeCompare(right))) {
+      const file = index.files.find((item) => item.path === path);
+      if (file) selected.push({ file, reasons: ["one-hop dependency"] });
+    }
+  }
+  const eligibleCount = selected.length;
+  const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
+  let mapTruncated = eligibleCount > candidates.length;
+  const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map((item) => item.path), "", "DEPENDENCIES"];
+  for (const candidate of candidates) for (const target of candidate.outgoing) if (candidates.some((item) => item.path === target)) optional.push(`${candidate.path} -> ${target}`);
+  optional.push("", "SYMBOLS");
+  for (const candidate of candidates) {
+    optional.push(candidate.path);
+    for (const item of candidate.symbols) optional.push(`  ${item.kind} ${item.signature} · line ${item.location.line}`);
+    optional.push(`  reason: ${candidate.reasons.join("; ")}`);
+  }
+  const scope = () => ["", "SCOPE", "source bodies not inspected", "unsupported import resolution: aliases, packages, dynamic imports", `index truncated: ${index.truncated ? "yes" : "no"}`, `map truncated: ${mapTruncated ? "yes" : "no"}`];
+  const kept: string[] = [];
+  for (const line of optional) {
+    const candidateText = [...kept, line, ...scope()].join("\n");
+    if (candidateText.length <= maxCharacters) kept.push(line);
+    else mapTruncated = true;
+  }
+  let text = [...kept, ...scope()].join("\n");
+  while (text.length > maxCharacters && kept.length) { kept.pop(); mapTruncated = true; text = [...kept, ...scope()].join("\n"); }
+  return { query, candidates, text, mapTruncated };
+}
+
 type ScanContent = {
   scannedPath: string;
   readmePath: string | null;
