@@ -261,12 +261,31 @@ test("scope-aware Repo Map ranking prefers requested implementation areas with e
   assert.equal(implementation.candidates[0]?.path, "packages/llm/src/adapter.ts");
   assert(implementation.candidates[0]?.reasons.includes("scope: product"));
   assert(implementation.candidates[0]?.reasons.includes("role: adapter"));
-  assert(implementation.candidates[0]?.reasons.includes("package: @repo/llm"));
+  assert.equal(implementation.candidates[0]?.packageName, "@repo/llm");
   const tests = queryRepositoryIndex(index, "Which adapter test covers DeepSeek?", { maxCharacters: 8_000, limit: 8 });
   assert.equal(tests.candidates[0]?.path, "packages/llm/test/adapter.test.ts");
   const vendor = queryRepositoryIndex(index, "Which vendor adapter is used?", { maxCharacters: 8_000, limit: 8 });
   assert.equal(vendor.candidates[0]?.path, "vendor/adapter.ts");
   assert(vendor.candidates.every((candidate) => candidate.reasons.length <= 3));
+});
+
+test("Repo Map renders confidence and scoped candidates within fixed budgets", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "package.json": JSON.stringify({ name: "@repo/root" }),
+    "src/adapter.ts": "export class DeepSeekAdapter {}",
+    "src/other-adapter.ts": "export class OtherAdapter {}",
+    "src/index.ts": "export const index = true"
+  }));
+  const high = queryRepositoryIndex(index, "DeepSeek adapter", { maxCharacters: 4_000, limit: 8 });
+  assert.equal(high.confidence, "high");
+  assert.match(high.text, /src\/adapter\.ts  \[product · package @repo\/root\]/);
+  assert.match(high.text, /reason: exact symbol match; scope: product; role: adapter/);
+  assert(high.text.length <= 4_000);
+  const ambiguous = queryRepositoryIndex(index, "adapter", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(ambiguous.confidence, "ambiguous");
+  const fallback = queryRepositoryIndex(index, "unmatched mystery", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(fallback.confidence, "fallback");
+  assert.match(fallback.text, /confidence: fallback/);
 });
 
 test("queryRepositoryIndex expands one hop, falls back to entries, and caps complete lines", async () => {

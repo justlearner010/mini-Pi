@@ -51,6 +51,8 @@ test("repository navigation builds a query Tool and supplies transient context",
   await runWithNavigation(agent, "provider configuration", navigation);
   assert.equal(calls.length, 1);
   assert.match(calls[0].options?.transientContext ?? "", /src\/llm\.ts/);
+  assert.match(calls[0].options?.transientContext ?? "", /confidence:/);
+  assert.match(calls[0].options?.transientContext ?? "", /scope: product/);
   assert.match(calls[0].options?.transientContext ?? "", /source bodies not inspected/);
 });
 

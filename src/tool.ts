@@ -308,7 +308,7 @@ export interface RepoMapCandidate {
   path: string; area: FileArea; packageRoot: string; packageName?: string;
   reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[];
 }
-export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; mapTruncated: boolean; }
+export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; confidence: "high" | "ambiguous" | "fallback"; mapTruncated: boolean; }
 
 function tokens(value: string): string[] {
   return value.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -354,7 +354,13 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
     const symbolTokens = new Set(file.symbols.flatMap((item) => tokens(item.name)).concat(file.exports.flatMap(tokens)));
     const pathTokens = new Set(tokens(file.path));
     const packageTokens = new Set(tokens(`${file.packageName ?? ""} ${file.packageRoot}`));
-    const exact = file.symbols.some((item) => queryTokens.has(item.name.toLowerCase())) || file.exports.some((item) => queryTokens.has(item.toLowerCase()));
+    const exact = file.symbols.some((item) => {
+      const nameTokens = tokens(item.name);
+      return nameTokens.length > 0 && nameTokens.every((term) => queryTokens.has(term));
+    }) || file.exports.some((item) => {
+      const nameTokens = tokens(item);
+      return nameTokens.length > 0 && nameTokens.every((term) => queryTokens.has(term));
+    });
     const symbolMatches = overlap(queryTokens, symbolTokens), pathMatches = overlap(queryTokens, pathTokens);
     const area = intent.requestedAreas.includes(file.area) || (intent.implementationSeeking && file.area === "product");
     const role = intent.roles.filter((item) => ROLE_LEXICON[item].match.some((term) => pathTokens.has(term) || symbolTokens.has(term))).length;
@@ -397,18 +403,24 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
       if (file) selected.push({ file, reasons: ["one-hop dependency"] });
     }
   }
+  const confidence = !seeds.length ? "fallback" : (() => {
+    const top = seeds[0]!.score, next = seeds[1]?.score;
+    const broadOnly = !top[0] && !top[1] && !top[2];
+    return broadOnly || (next !== undefined && compareScore(top, next) === 0) ? "ambiguous" : "high";
+  })();
   const eligibleCount = selected.length;
   const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, area: file.area, packageRoot: file.packageRoot, ...(file.packageName ? { packageName: file.packageName } : {}), reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
   let mapTruncated = eligibleCount > candidates.length;
-  const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map((item) => item.path), "", "DEPENDENCIES"];
+  const label = (item: RepoMapCandidate) => `${item.path}  [${item.area} · package ${item.packageName ?? item.packageRoot}]`;
+  const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map(label), "", "DEPENDENCIES"];
   for (const candidate of candidates) for (const target of candidate.outgoing) if (candidates.some((item) => item.path === target)) optional.push(`${candidate.path} -> ${target}`);
   optional.push("", "SYMBOLS");
   for (const candidate of candidates) {
-    optional.push(candidate.path);
+    optional.push(label(candidate));
     for (const item of candidate.symbols) optional.push(`  ${item.kind} ${item.signature} · line ${item.location.line}`);
     optional.push(`  reason: ${candidate.reasons.join("; ")}`);
   }
-  const scope = () => ["", "SCOPE", "source bodies not inspected", "unsupported import resolution: aliases, packages, dynamic imports", `index truncated: ${index.truncated ? "yes" : "no"}`, `map truncated: ${mapTruncated ? "yes" : "no"}`];
+  const scope = () => ["", "SCOPE", `confidence: ${confidence}`, "source bodies not inspected", "unsupported import resolution: aliases, packages, dynamic imports", `index truncated: ${index.truncated ? "yes" : "no"}`, `map truncated: ${mapTruncated ? "yes" : "no"}`];
   const kept: string[] = [];
   for (const line of optional) {
     const candidateText = [...kept, line, ...scope()].join("\n");
@@ -417,7 +429,7 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
   }
   let text = [...kept, ...scope()].join("\n");
   while (text.length > maxCharacters && kept.length) { kept.pop(); mapTruncated = true; text = [...kept, ...scope()].join("\n"); }
-  return { query, candidates, text, mapTruncated };
+  return { query, candidates, text, confidence, mapTruncated };
 }
 
 function capCodePoints(value: string, limit: number): string { return [...value].slice(0, limit).join(""); }
