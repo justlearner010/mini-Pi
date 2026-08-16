@@ -1,5 +1,5 @@
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
-import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { builtinModules } from "node:module";
 import ignore from "ignore";
 import ts from "typescript";
@@ -129,7 +129,13 @@ export interface SymbolInfo {
   location: SourceLocation;
   signatureTruncated: boolean;
 }
-export interface FileInfo { path: string; sourceKind: SourceKind; imports: ImportInfo[]; exports: string[]; symbols: SymbolInfo[]; parseDiagnostics: number; }
+export type FileArea = "product" | "test" | "vendor" | "example" | "generated";
+export interface PackageInfo { root: string; name?: string; workspace: boolean; }
+export interface FileInfo {
+  path: string; sourceKind: SourceKind; imports: ImportInfo[]; exports: string[];
+  symbols: SymbolInfo[]; parseDiagnostics: number;
+  area: FileArea; packageRoot: string; packageName?: string;
+}
 export interface RepositoryIndex {
   files: readonly FileInfo[];
   incoming: ReadonlyMap<string, readonly string[]>;
@@ -170,7 +176,50 @@ function importKind(specifier: string): ImportInfo["kind"] {
   return "package";
 }
 
-async function indexFile(root: string, file: DiscoveredSource): Promise<FileInfo> {
+export function classifyFileArea(path: string): FileArea {
+  const segments = path.toLowerCase().split("/");
+  const name = segments.at(-1) ?? "";
+  if (segments.some((segment) => ["test", "tests", "__tests__", "spec", "specs"].includes(segment)) || /\.(test|spec)\.[^.]+$/.test(name)) return "test";
+  if (segments.some((segment) => ["vendor", "third_party", "third-party", "external"].includes(segment))) return "vendor";
+  if (segments.some((segment) => ["example", "examples", "demo", "demos", "sample"].includes(segment))) return "example";
+  if (segments.some((segment) => ["generated", "gen", "codegen"].includes(segment)) || /\.generated\.[^.]+$/.test(name)) return "generated";
+  return "product";
+}
+
+const MAX_PACKAGE_MANIFEST_BYTES = 256 * 1024;
+async function packageAt(root: string, directory: string, cache: Map<string, Promise<PackageInfo | undefined>>): Promise<PackageInfo | undefined> {
+  const packageRoot = relativePath(root, directory) || ".";
+  let entry = cache.get(packageRoot);
+  if (!entry) {
+    entry = (async () => {
+      try {
+        const manifest = resolve(directory, "package.json");
+        const status = await lstat(manifest);
+        if (!status.isFile() || status.isSymbolicLink()) return undefined;
+        const bytes = await readFile(manifest);
+        if (bytes.byteLength > MAX_PACKAGE_MANIFEST_BYTES) return undefined;
+        const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+        const name = typeof (parsed as { name?: unknown }).name === "string" && (parsed as { name: string }).name.trim() ? (parsed as { name: string }).name : undefined;
+        return { root: packageRoot, ...(name ? { name } : {}), workspace: packageRoot !== "." };
+      } catch { return undefined; }
+    })();
+    cache.set(packageRoot, entry);
+  }
+  return entry;
+}
+
+async function packageForFile(root: string, path: string, cache: Map<string, Promise<PackageInfo | undefined>>): Promise<PackageInfo> {
+  let directory = dirname(resolve(root, path));
+  while (isWithin(root, directory)) {
+    const found = await packageAt(root, directory, cache);
+    if (found) return found;
+    if (directory === root) break;
+    directory = dirname(directory);
+  }
+  return { root: ".", workspace: false };
+}
+
+async function indexFile(root: string, file: DiscoveredSource, metadata: Pick<FileInfo, "area" | "packageRoot" | "packageName">): Promise<FileInfo> {
   const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, scriptKind(file.sourceKind));
   const imports: ImportInfo[] = [], symbols: SymbolInfo[] = [], exportedNames: string[] = [];
   for (const statement of source.statements) {
@@ -225,13 +274,17 @@ async function indexFile(root: string, file: DiscoveredSource): Promise<FileInfo
   imports.sort((left, right) => left.specifier.localeCompare(right.specifier) || left.kind.localeCompare(right.kind));
   symbols.sort((left, right) => left.kind.localeCompare(right.kind) || left.name.localeCompare(right.name));
   exportedNames.sort((left, right) => left.localeCompare(right));
-  return { path: file.path, sourceKind: file.sourceKind, imports, exports: [...new Set(exportedNames)], symbols, parseDiagnostics: (source as unknown as { parseDiagnostics: readonly unknown[] }).parseDiagnostics.length };
+  return { path: file.path, sourceKind: file.sourceKind, imports, exports: [...new Set(exportedNames)], symbols, parseDiagnostics: (source as unknown as { parseDiagnostics: readonly unknown[] }).parseDiagnostics.length, ...metadata };
 }
 
 export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIndexLimits = REPOSITORY_INDEX_LIMITS): Promise<RepositoryIndex> {
   const root = await realpath(rootDir);
   const discovery = await discoverRepositorySources(root, limits);
-  const files = await Promise.all(discovery.files.map((file) => indexFile(root, file)));
+  const packageCache = new Map<string, Promise<PackageInfo | undefined>>();
+  const files = await Promise.all(discovery.files.map(async (file) => {
+    const packageInfo = await packageForFile(root, file.path, packageCache);
+    return indexFile(root, file, { area: classifyFileArea(file.path), packageRoot: packageInfo.root, ...(packageInfo.name ? { packageName: packageInfo.name } : {}) });
+  }));
   const fileNames = new Set(files.map((file) => file.path));
   const outgoing = new Map<string, string[]>(), incoming = new Map<string, string[]>();
   for (const file of files) { outgoing.set(file.path, []); incoming.set(file.path, []); }

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, buildRepositoryIndex, createQueryRepoMapTool, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, classifyFileArea, createQueryRepoMapTool, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -81,6 +81,61 @@ test("repository discovery never follows file or directory symlinks", async () =
   await symlink(join(rootDir, "real"), join(rootDir, "linked"));
   const result = await discoverRepositorySources(rootDir);
   assert.deepEqual(result.files.map((file) => file.path), ["inside.ts", "real/nested.ts"]);
+});
+
+test("repository index classifies file areas and nearest package metadata", async () => {
+  assert.equal(classifyFileArea("src/agent.ts"), "product");
+  assert.equal(classifyFileArea("test/agent.test.ts"), "test");
+  assert.equal(classifyFileArea("vendor/sdk/client.ts"), "vendor");
+  assert.equal(classifyFileArea("examples/demo.ts"), "example");
+  assert.equal(classifyFileArea("src/generated/types.ts"), "generated");
+  const index = await buildRepositoryIndex(await project({
+    "package.json": JSON.stringify({ name: "root-package", scripts: { ignored: "true" } }),
+    "src/agent.ts": "export class Agent {}",
+    "test/agent.test.ts": "export const test = true",
+    "vendor/sdk/client.ts": "export const client = true",
+    "examples/demo.ts": "export const demo = true",
+    "src/generated/types.ts": "export interface Generated {}",
+    "packages/core/package.json": JSON.stringify({ name: "@repo/core" }),
+    "packages/core/src/engine.ts": "export function run() {}"
+  }));
+  assert.deepEqual(index.files.map((file) => [file.path, file.area, file.packageRoot, file.packageName]), [
+    ["examples/demo.ts", "example", ".", "root-package"],
+    ["packages/core/src/engine.ts", "product", "packages/core", "@repo/core"],
+    ["src/agent.ts", "product", ".", "root-package"],
+    ["src/generated/types.ts", "generated", ".", "root-package"],
+    ["test/agent.test.ts", "test", ".", "root-package"],
+    ["vendor/sdk/client.ts", "vendor", ".", "root-package"]
+  ]);
+});
+
+test("repository index degrades safely for malformed and oversized package manifests", async () => {
+  const rootDir = await project({
+    "package.json": "{invalid",
+    "src/root.ts": "export const root = true",
+    "packages/invalid/package.json": "{also invalid",
+    "packages/invalid/src/a.ts": "export const a = true",
+    "packages/large/package.json": JSON.stringify({ name: "x".repeat(256 * 1024) }),
+    "packages/large/src/b.ts": "export const b = true",
+    "packages/valid/package.json": JSON.stringify({ name: "@repo/valid" }),
+    "packages/valid/src/c.ts": "export const c = true"
+  });
+  const index = await buildRepositoryIndex(rootDir);
+  assert.deepEqual(index.files.map((file) => [file.path, file.packageRoot, file.packageName]), [
+    ["packages/invalid/src/a.ts", ".", undefined],
+    ["packages/large/src/b.ts", ".", undefined],
+    ["packages/valid/src/c.ts", "packages/valid", "@repo/valid"],
+    ["src/root.ts", ".", undefined]
+  ]);
+  const restricted = join(rootDir, "packages", "restricted", "package.json");
+  await mkdir(join(restricted, ".."), { recursive: true });
+  await writeFile(restricted, JSON.stringify({ name: "@repo/restricted" }));
+  await writeFile(join(rootDir, "packages", "restricted", "entry.ts"), "export const restricted = true");
+  await chmod(restricted, 0o000);
+  try {
+    const rebuilt = await buildRepositoryIndex(rootDir);
+    assert.equal(rebuilt.files.find((file) => file.path === "packages/restricted/entry.ts")?.packageName, undefined);
+  } finally { await chmod(restricted, 0o600); }
 });
 
 test("repository index extracts syntax metadata without bodies or private methods", async () => {
