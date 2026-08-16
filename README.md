@@ -124,3 +124,5 @@ npm run verify:repo-map
 实验使用固定假模型轨迹，只验证候选定位、上下文边界和工具探索量；它不证明真实 Provider token、价格或端到端延迟已经下降。完整结果见 [Issue #9 实验报告](docs/experiments/9-query-aware-repo-map.md)。
 
 在外部大型 monorepo `deepseek-harness` 上，Issue #16 先确认简单词面 Ranking 不足；Issue #18 随后以同一五题验证了 scope/package/角色排序的改进（产品范围 Top-1 `3/5`、Top-3 `5/5`）。两份证据与限制分别见 [基线评估](docs/experiments/10-deepseek-harness-repo-map-evaluation.md) 和 [Issue #18 报告](docs/experiments/18-scope-aware-repo-map-ranking.md)。两项实验都不调用真实 Provider。
+
+Issue #20 在同一五题上做过一次受 20 次请求预算限制的真实 DeepSeek 运行，记录了实际 token usage 与请求完成延迟；它不保存源码/回答，也不构成普遍质量或价格结论。结果与限制见 [真实 Provider 评估报告](docs/experiments/20-live-provider-repo-map-evaluation.md)。
