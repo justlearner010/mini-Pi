@@ -297,7 +297,17 @@ export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIn
   return { files, incoming, outgoing, entryCandidates, inspectedFileCount: files.length, inspectedBytes: discovery.inspectedBytes, skipped: Object.freeze({ ...discovery.skipped, nestedGitignore: discovery.nestedGitignoreFiles, unsupportedLanguage: discovery.unsupportedLanguageFiles }), truncated: discovery.truncated };
 }
 
-export interface RepoMapCandidate { path: string; reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[]; }
+export type QueryRole = "cli" | "adapter" | "loop" | "registry" | "config";
+export interface QueryIntent {
+  tokens: readonly string[];
+  requestedAreas: readonly FileArea[];
+  roles: readonly QueryRole[];
+  implementationSeeking: boolean;
+}
+export interface RepoMapCandidate {
+  path: string; area: FileArea; packageRoot: string; packageName?: string;
+  reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[];
+}
 export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; mapTruncated: boolean; }
 
 function tokens(value: string): string[] {
@@ -309,22 +319,53 @@ function overlap(left: Set<string>, right: Set<string>): number {
   return count;
 }
 
+const ROLE_LEXICON: Readonly<Record<QueryRole, { query: readonly string[]; match: readonly string[] }>> = {
+  cli: { query: ["cli", "command", "terminal", "shell"], match: ["cli", "command", "bin", "terminal"] },
+  adapter: { query: ["adapter", "provider", "llm", "model"], match: ["adapter", "provider", "llm", "client"] },
+  loop: { query: ["loop", "agent", "run", "turn"], match: ["agent", "loop", "run", "turn"] },
+  registry: { query: ["tool", "tools", "registry", "execute"], match: ["tool", "registry", "execute"] },
+  config: { query: ["config", "configuration", "settings", "env"], match: ["config", "settings", "env", "option"] }
+};
+const AREA_TERMS: Readonly<Record<FileArea, readonly string[]>> = {
+  product: [], test: ["test", "spec", "fixture"], vendor: ["vendor", "third", "party"],
+  example: ["example", "demo"], generated: ["generated", "codegen"]
+};
+
+export function deriveQueryIntent(query: string): QueryIntent {
+  const normalized = tokens(query);
+  const values = new Set(normalized);
+  const roles = (Object.keys(ROLE_LEXICON) as QueryRole[]).filter((role) => ROLE_LEXICON[role].query.some((term) => values.has(term)));
+  const requestedAreas = (Object.keys(AREA_TERMS) as FileArea[]).filter((area) => area !== "product" && AREA_TERMS[area].some((term) => values.has(term)));
+  return { tokens: normalized, requestedAreas, roles, implementationSeeking: roles.length > 0 && requestedAreas.length === 0 };
+}
+
+type CandidateScore = readonly [number, number, number, number, number, number, number, number];
+function compareScore(left: CandidateScore, right: CandidateScore): number {
+  for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return right[index] - left[index];
+  return 0;
+}
+
 export function queryRepositoryIndex(index: RepositoryIndex, query: string, options: { maxCharacters?: 4_000 | 8_000; limit?: number } = {}): RepoMapResult {
   const maxCharacters = options.maxCharacters ?? 8_000, limit = options.limit ?? 8;
   if (!query.trim() || !Number.isInteger(limit) || limit < 1 || limit > 8) throw new Error("Repo Map query and limit are invalid");
-  const queryTokens = new Set(tokens(query));
+  const intent = deriveQueryIntent(query);
+  const queryTokens = new Set(intent.tokens);
   const ranked = index.files.map((file) => {
     const symbolTokens = new Set(file.symbols.flatMap((item) => tokens(item.name)).concat(file.exports.flatMap(tokens)));
     const pathTokens = new Set(tokens(file.path));
+    const packageTokens = new Set(tokens(`${file.packageName ?? ""} ${file.packageRoot}`));
     const exact = file.symbols.some((item) => queryTokens.has(item.name.toLowerCase())) || file.exports.some((item) => queryTokens.has(item.toLowerCase()));
     const symbolMatches = overlap(queryTokens, symbolTokens), pathMatches = overlap(queryTokens, pathTokens);
-    return { file, score: [Number(exact), symbolMatches, pathMatches, Number(index.entryCandidates.includes(file.path)), index.incoming.get(file.path)?.length ?? 0] as const };
+    const area = intent.requestedAreas.includes(file.area) || (intent.implementationSeeking && file.area === "product");
+    const role = intent.roles.filter((item) => ROLE_LEXICON[item].match.some((term) => pathTokens.has(term) || symbolTokens.has(term))).length;
+    const packageMatches = overlap(queryTokens, packageTokens);
+    const entry = Number(intent.roles.includes("cli") && index.entryCandidates.includes(file.path));
+    return { file, score: [Number(exact), Number(area), role, packageMatches, symbolMatches, pathMatches, entry, index.incoming.get(file.path)?.length ?? 0] as CandidateScore };
   });
   ranked.sort((left, right) => {
-    for (let index = 0; index < left.score.length; index += 1) if (left.score[index] !== right.score[index]) return right.score[index] - left.score[index];
-    return left.file.path.localeCompare(right.file.path);
+    return compareScore(left.score, right.score) || left.file.path.localeCompare(right.file.path);
   });
-  const seeds = ranked.filter((item) => item.score[0] || item.score[1] || item.score[2]);
+  const seeds = ranked.filter((item) => item.score[0] || item.score[2] || item.score[3] || item.score[4] || item.score[5]);
   const selected: Array<{ file: FileInfo; reasons: string[] }> = [];
   if (!seeds.length) {
     for (const path of index.entryCandidates) {
@@ -333,7 +374,19 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
     }
   } else {
     for (const item of seeds) {
-      const reasons = [item.score[0] ? "exact symbol match" : "", item.score[1] ? "symbol match" : "", item.score[2] ? "path match" : ""].filter(Boolean);
+      const roleReason = intent.roles.find((role) => ROLE_LEXICON[role].match.some((term) => {
+        return tokens(item.file.path).includes(term) || item.file.symbols.some((symbol) => tokens(symbol.name).includes(term));
+      })) ?? "match";
+      const reasons = [
+        item.score[0] ? "exact symbol match" : "",
+        item.score[1] ? `scope: ${item.file.area}` : "",
+        item.score[2] ? `role: ${roleReason}` : "",
+        item.score[3] ? `package: ${item.file.packageName ?? item.file.packageRoot}` : "",
+        item.score[4] ? "symbol match" : "",
+        item.score[5] ? "path match" : "",
+        item.score[6] ? "entry candidate" : "",
+        item.score[7] ? "dependency" : ""
+      ].filter(Boolean).slice(0, 3);
       selected.push({ file: item.file, reasons });
     }
     const seedPaths = new Set(selected.map((item) => item.file.path));
@@ -345,7 +398,7 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
     }
   }
   const eligibleCount = selected.length;
-  const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
+  const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, area: file.area, packageRoot: file.packageRoot, ...(file.packageName ? { packageName: file.packageName } : {}), reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
   let mapTruncated = eligibleCount > candidates.length;
   const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map((item) => item.path), "", "DEPENDENCIES"];
   for (const candidate of candidates) for (const target of candidate.outgoing) if (candidates.some((item) => item.path === target)) optional.push(`${candidate.path} -> ${target}`);

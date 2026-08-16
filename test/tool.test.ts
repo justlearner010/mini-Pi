@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, buildRepositoryIndex, classifyFileArea, createQueryRepoMapTool, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, classifyFileArea, createQueryRepoMapTool, deriveQueryIntent, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -233,6 +233,40 @@ test("queryRepositoryIndex locates the five declared navigation targets", async 
     assert.match(result.text, /map truncated: no/);
   }
   assert(top1 >= 4, `only ${top1}/5 Top-1 matches`);
+});
+
+test("scope-aware Repo Map ranking prefers requested implementation areas with explicit reasons", async () => {
+  assert.deepEqual(deriveQueryIntent("Where is the CLI provider adapter?"), {
+    tokens: ["where", "is", "the", "cli", "provider", "adapter"], requestedAreas: [],
+    roles: ["cli", "adapter"], implementationSeeking: true
+  });
+  assert.deepEqual(deriveQueryIntent("Inspect generated vendor test fixtures"), {
+    tokens: ["inspect", "generated", "vendor", "test", "fixtures"],
+    requestedAreas: ["test", "vendor", "generated"], roles: [], implementationSeeking: false
+  });
+  assert.deepEqual(deriveQueryIntent("unrelated mystery"), {
+    tokens: ["unrelated", "mystery"], requestedAreas: [], roles: [], implementationSeeking: false
+  });
+  const index = await buildRepositoryIndex(await project({
+    "packages/cli/package.json": JSON.stringify({ name: "@repo/cli" }),
+    "packages/cli/src/bin.ts": "export function runCli() {}",
+    "packages/core/src/agent.ts": "export class Agent { run() {} }",
+    "packages/llm/package.json": JSON.stringify({ name: "@repo/llm" }),
+    "packages/llm/src/adapter.ts": "export class DeepSeekAdapter {}",
+    "packages/tools/src/registry.ts": "export class ToolRegistry { execute() {} }",
+    "packages/llm/test/adapter.test.ts": "export const adapterTest = true",
+    "vendor/adapter.ts": "export class ExternalClient {}"
+  }));
+  const implementation = queryRepositoryIndex(index, "Where is the DeepSeek LLM provider adapter?", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(implementation.candidates[0]?.path, "packages/llm/src/adapter.ts");
+  assert(implementation.candidates[0]?.reasons.includes("scope: product"));
+  assert(implementation.candidates[0]?.reasons.includes("role: adapter"));
+  assert(implementation.candidates[0]?.reasons.includes("package: @repo/llm"));
+  const tests = queryRepositoryIndex(index, "Which adapter test covers DeepSeek?", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(tests.candidates[0]?.path, "packages/llm/test/adapter.test.ts");
+  const vendor = queryRepositoryIndex(index, "Which vendor adapter is used?", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(vendor.candidates[0]?.path, "vendor/adapter.ts");
+  assert(vendor.candidates.every((candidate) => candidate.reasons.length <= 3));
 });
 
 test("queryRepositoryIndex expands one hop, falls back to entries, and caps complete lines", async () => {
