@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, buildRepositoryIndex, createQueryRepoMapTool, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, classifyFileArea, createQueryRepoMapTool, deriveQueryIntent, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -81,6 +81,61 @@ test("repository discovery never follows file or directory symlinks", async () =
   await symlink(join(rootDir, "real"), join(rootDir, "linked"));
   const result = await discoverRepositorySources(rootDir);
   assert.deepEqual(result.files.map((file) => file.path), ["inside.ts", "real/nested.ts"]);
+});
+
+test("repository index classifies file areas and nearest package metadata", async () => {
+  assert.equal(classifyFileArea("src/agent.ts"), "product");
+  assert.equal(classifyFileArea("test/agent.test.ts"), "test");
+  assert.equal(classifyFileArea("vendor/sdk/client.ts"), "vendor");
+  assert.equal(classifyFileArea("examples/demo.ts"), "example");
+  assert.equal(classifyFileArea("src/generated/types.ts"), "generated");
+  const index = await buildRepositoryIndex(await project({
+    "package.json": JSON.stringify({ name: "root-package", scripts: { ignored: "true" } }),
+    "src/agent.ts": "export class Agent {}",
+    "test/agent.test.ts": "export const test = true",
+    "vendor/sdk/client.ts": "export const client = true",
+    "examples/demo.ts": "export const demo = true",
+    "src/generated/types.ts": "export interface Generated {}",
+    "packages/core/package.json": JSON.stringify({ name: "@repo/core" }),
+    "packages/core/src/engine.ts": "export function run() {}"
+  }));
+  assert.deepEqual(index.files.map((file) => [file.path, file.area, file.packageRoot, file.packageName]), [
+    ["examples/demo.ts", "example", ".", "root-package"],
+    ["packages/core/src/engine.ts", "product", "packages/core", "@repo/core"],
+    ["src/agent.ts", "product", ".", "root-package"],
+    ["src/generated/types.ts", "generated", ".", "root-package"],
+    ["test/agent.test.ts", "test", ".", "root-package"],
+    ["vendor/sdk/client.ts", "vendor", ".", "root-package"]
+  ]);
+});
+
+test("repository index degrades safely for malformed and oversized package manifests", async () => {
+  const rootDir = await project({
+    "package.json": "{invalid",
+    "src/root.ts": "export const root = true",
+    "packages/invalid/package.json": "{also invalid",
+    "packages/invalid/src/a.ts": "export const a = true",
+    "packages/large/package.json": JSON.stringify({ name: "x".repeat(256 * 1024) }),
+    "packages/large/src/b.ts": "export const b = true",
+    "packages/valid/package.json": JSON.stringify({ name: "@repo/valid" }),
+    "packages/valid/src/c.ts": "export const c = true"
+  });
+  const index = await buildRepositoryIndex(rootDir);
+  assert.deepEqual(index.files.map((file) => [file.path, file.packageRoot, file.packageName]), [
+    ["packages/invalid/src/a.ts", ".", undefined],
+    ["packages/large/src/b.ts", ".", undefined],
+    ["packages/valid/src/c.ts", "packages/valid", "@repo/valid"],
+    ["src/root.ts", ".", undefined]
+  ]);
+  const restricted = join(rootDir, "packages", "restricted", "package.json");
+  await mkdir(join(restricted, ".."), { recursive: true });
+  await writeFile(restricted, JSON.stringify({ name: "@repo/restricted" }));
+  await writeFile(join(rootDir, "packages", "restricted", "entry.ts"), "export const restricted = true");
+  await chmod(restricted, 0o000);
+  try {
+    const rebuilt = await buildRepositoryIndex(rootDir);
+    assert.equal(rebuilt.files.find((file) => file.path === "packages/restricted/entry.ts")?.packageName, undefined);
+  } finally { await chmod(restricted, 0o600); }
 });
 
 test("repository index extracts syntax metadata without bodies or private methods", async () => {
@@ -178,6 +233,63 @@ test("queryRepositoryIndex locates the five declared navigation targets", async 
     assert.match(result.text, /map truncated: no/);
   }
   assert(top1 >= 4, `only ${top1}/5 Top-1 matches`);
+});
+
+test("scope-aware Repo Map ranking prefers requested implementation areas with explicit reasons", async () => {
+  assert.deepEqual(deriveQueryIntent("Where is the CLI provider adapter?"), {
+    tokens: ["where", "is", "the", "cli", "provider", "adapter"], requestedAreas: [],
+    roles: ["cli", "adapter"], implementationSeeking: true
+  });
+  assert.deepEqual(deriveQueryIntent("Inspect generated vendor test fixtures"), {
+    tokens: ["inspect", "generated", "vendor", "test", "fixtures"],
+    requestedAreas: ["test", "vendor", "generated"], roles: [], implementationSeeking: false
+  });
+  assert.deepEqual(deriveQueryIntent("unrelated mystery"), {
+    tokens: ["unrelated", "mystery"], requestedAreas: [], roles: [], implementationSeeking: false
+  });
+  const index = await buildRepositoryIndex(await project({
+    "packages/cli/package.json": JSON.stringify({ name: "@repo/cli" }),
+    "packages/cli/src/bin.ts": "export function runCli() {}",
+    "packages/core/src/agent.ts": "export class Agent { run() {} }",
+    "packages/llm/package.json": JSON.stringify({ name: "@repo/llm" }),
+    "packages/llm/src/adapter.ts": "export class DeepSeekAdapter {}",
+    "packages/tools/src/registry.ts": "export class ToolRegistry { execute() {} }",
+    "packages/llm/test/adapter.test.ts": "export const adapterTest = true",
+    "vendor/adapter.ts": "export class ExternalClient {}"
+  }));
+  const implementation = queryRepositoryIndex(index, "Where is the DeepSeek LLM provider adapter?", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(implementation.candidates[0]?.path, "packages/llm/src/adapter.ts");
+  assert(implementation.candidates[0]?.reasons.includes("scope: product"));
+  assert(implementation.candidates[0]?.reasons.includes("role: adapter"));
+  assert.equal(implementation.candidates[0]?.packageName, "@repo/llm");
+  const tests = queryRepositoryIndex(index, "Which adapter test covers DeepSeek?", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(tests.candidates[0]?.path, "packages/llm/test/adapter.test.ts");
+  const vendor = queryRepositoryIndex(index, "Which vendor adapter is used?", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(vendor.candidates[0]?.path, "vendor/adapter.ts");
+  assert(vendor.candidates.every((candidate) => candidate.reasons.length <= 3));
+});
+
+test("Repo Map renders confidence and scoped candidates within fixed budgets", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "package.json": JSON.stringify({ name: "@repo/root" }),
+    "src/adapter.ts": "export class DeepSeekAdapter {}",
+    "src/other-adapter.ts": "export class OtherAdapter {}",
+    "src/index.ts": "export const index = true"
+  }));
+  const high = queryRepositoryIndex(index, "DeepSeek adapter", { maxCharacters: 4_000, limit: 8 });
+  assert.equal(high.confidence, "high");
+  assert.match(high.text, /src\/adapter\.ts  \[product · package @repo\/root\]/);
+  assert.match(high.text, /reason: scope: product; role: adapter; role file form/);
+  assert(high.text.length <= 4_000);
+  const tied = await buildRepositoryIndex(await project({
+    "src/one.ts": "export const adapter = true",
+    "src/two.ts": "export const adapter = true"
+  }));
+  const ambiguous = queryRepositoryIndex(tied, "adapter", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(ambiguous.confidence, "ambiguous");
+  const fallback = queryRepositoryIndex(index, "unmatched mystery", { maxCharacters: 8_000, limit: 8 });
+  assert.equal(fallback.confidence, "fallback");
+  assert.match(fallback.text, /confidence: fallback/);
 });
 
 test("queryRepositoryIndex expands one hop, falls back to entries, and caps complete lines", async () => {

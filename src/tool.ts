@@ -1,5 +1,5 @@
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
-import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { builtinModules } from "node:module";
 import ignore from "ignore";
 import ts from "typescript";
@@ -129,7 +129,13 @@ export interface SymbolInfo {
   location: SourceLocation;
   signatureTruncated: boolean;
 }
-export interface FileInfo { path: string; sourceKind: SourceKind; imports: ImportInfo[]; exports: string[]; symbols: SymbolInfo[]; parseDiagnostics: number; }
+export type FileArea = "product" | "test" | "vendor" | "example" | "generated";
+export interface PackageInfo { root: string; name?: string; workspace: boolean; }
+export interface FileInfo {
+  path: string; sourceKind: SourceKind; imports: ImportInfo[]; exports: string[];
+  symbols: SymbolInfo[]; parseDiagnostics: number;
+  area: FileArea; packageRoot: string; packageName?: string;
+}
 export interface RepositoryIndex {
   files: readonly FileInfo[];
   incoming: ReadonlyMap<string, readonly string[]>;
@@ -170,7 +176,50 @@ function importKind(specifier: string): ImportInfo["kind"] {
   return "package";
 }
 
-async function indexFile(root: string, file: DiscoveredSource): Promise<FileInfo> {
+export function classifyFileArea(path: string): FileArea {
+  const segments = path.toLowerCase().split("/");
+  const name = segments.at(-1) ?? "";
+  if (segments.some((segment) => ["test", "tests", "__tests__", "spec", "specs"].includes(segment)) || /\.(test|spec)\.[^.]+$/.test(name)) return "test";
+  if (segments.some((segment) => ["vendor", "third_party", "third-party", "external"].includes(segment))) return "vendor";
+  if (segments.some((segment) => ["example", "examples", "demo", "demos", "sample"].includes(segment))) return "example";
+  if (segments.some((segment) => ["generated", "gen", "codegen"].includes(segment)) || /\.generated\.[^.]+$/.test(name)) return "generated";
+  return "product";
+}
+
+const MAX_PACKAGE_MANIFEST_BYTES = 256 * 1024;
+async function packageAt(root: string, directory: string, cache: Map<string, Promise<PackageInfo | undefined>>): Promise<PackageInfo | undefined> {
+  const packageRoot = relativePath(root, directory) || ".";
+  let entry = cache.get(packageRoot);
+  if (!entry) {
+    entry = (async () => {
+      try {
+        const manifest = resolve(directory, "package.json");
+        const status = await lstat(manifest);
+        if (!status.isFile() || status.isSymbolicLink()) return undefined;
+        const bytes = await readFile(manifest);
+        if (bytes.byteLength > MAX_PACKAGE_MANIFEST_BYTES) return undefined;
+        const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+        const name = typeof (parsed as { name?: unknown }).name === "string" && (parsed as { name: string }).name.trim() ? (parsed as { name: string }).name : undefined;
+        return { root: packageRoot, ...(name ? { name } : {}), workspace: packageRoot !== "." };
+      } catch { return undefined; }
+    })();
+    cache.set(packageRoot, entry);
+  }
+  return entry;
+}
+
+async function packageForFile(root: string, path: string, cache: Map<string, Promise<PackageInfo | undefined>>): Promise<PackageInfo> {
+  let directory = dirname(resolve(root, path));
+  while (isWithin(root, directory)) {
+    const found = await packageAt(root, directory, cache);
+    if (found) return found;
+    if (directory === root) break;
+    directory = dirname(directory);
+  }
+  return { root: ".", workspace: false };
+}
+
+async function indexFile(root: string, file: DiscoveredSource, metadata: Pick<FileInfo, "area" | "packageRoot" | "packageName">): Promise<FileInfo> {
   const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, scriptKind(file.sourceKind));
   const imports: ImportInfo[] = [], symbols: SymbolInfo[] = [], exportedNames: string[] = [];
   for (const statement of source.statements) {
@@ -225,13 +274,17 @@ async function indexFile(root: string, file: DiscoveredSource): Promise<FileInfo
   imports.sort((left, right) => left.specifier.localeCompare(right.specifier) || left.kind.localeCompare(right.kind));
   symbols.sort((left, right) => left.kind.localeCompare(right.kind) || left.name.localeCompare(right.name));
   exportedNames.sort((left, right) => left.localeCompare(right));
-  return { path: file.path, sourceKind: file.sourceKind, imports, exports: [...new Set(exportedNames)], symbols, parseDiagnostics: (source as unknown as { parseDiagnostics: readonly unknown[] }).parseDiagnostics.length };
+  return { path: file.path, sourceKind: file.sourceKind, imports, exports: [...new Set(exportedNames)], symbols, parseDiagnostics: (source as unknown as { parseDiagnostics: readonly unknown[] }).parseDiagnostics.length, ...metadata };
 }
 
 export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIndexLimits = REPOSITORY_INDEX_LIMITS): Promise<RepositoryIndex> {
   const root = await realpath(rootDir);
   const discovery = await discoverRepositorySources(root, limits);
-  const files = await Promise.all(discovery.files.map((file) => indexFile(root, file)));
+  const packageCache = new Map<string, Promise<PackageInfo | undefined>>();
+  const files = await Promise.all(discovery.files.map(async (file) => {
+    const packageInfo = await packageForFile(root, file.path, packageCache);
+    return indexFile(root, file, { area: classifyFileArea(file.path), packageRoot: packageInfo.root, ...(packageInfo.name ? { packageName: packageInfo.name } : {}) });
+  }));
   const fileNames = new Set(files.map((file) => file.path));
   const outgoing = new Map<string, string[]>(), incoming = new Map<string, string[]>();
   for (const file of files) { outgoing.set(file.path, []); incoming.set(file.path, []); }
@@ -244,8 +297,18 @@ export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIn
   return { files, incoming, outgoing, entryCandidates, inspectedFileCount: files.length, inspectedBytes: discovery.inspectedBytes, skipped: Object.freeze({ ...discovery.skipped, nestedGitignore: discovery.nestedGitignoreFiles, unsupportedLanguage: discovery.unsupportedLanguageFiles }), truncated: discovery.truncated };
 }
 
-export interface RepoMapCandidate { path: string; reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[]; }
-export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; mapTruncated: boolean; }
+export type QueryRole = "cli" | "adapter" | "loop" | "registry" | "config" | "compaction";
+export interface QueryIntent {
+  tokens: readonly string[];
+  requestedAreas: readonly FileArea[];
+  roles: readonly QueryRole[];
+  implementationSeeking: boolean;
+}
+export interface RepoMapCandidate {
+  path: string; area: FileArea; packageRoot: string; packageName?: string;
+  reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[];
+}
+export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; confidence: "high" | "ambiguous" | "fallback"; mapTruncated: boolean; }
 
 function tokens(value: string): string[] {
   return value.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -256,22 +319,68 @@ function overlap(left: Set<string>, right: Set<string>): number {
   return count;
 }
 
+const ROLE_LEXICON: Readonly<Record<QueryRole, { query: readonly string[]; match: readonly string[] }>> = {
+  cli: { query: ["cli", "command", "terminal", "shell"], match: ["cli", "command", "bin", "terminal"] },
+  adapter: { query: ["adapter", "provider", "llm", "model"], match: ["adapter", "provider", "llm", "client"] },
+  loop: { query: ["loop", "agent", "run", "turn"], match: ["agent", "loop", "run", "turn"] },
+  registry: { query: ["tool", "tools", "registry", "execute"], match: ["tool", "registry", "execute"] },
+  config: { query: ["config", "configuration", "settings", "env"], match: ["config", "settings", "env", "option"] },
+  compaction: { query: ["compaction", "compact", "context"], match: ["compaction", "compact", "context"] }
+};
+const AREA_TERMS: Readonly<Record<FileArea, readonly string[]>> = {
+  product: [], test: ["test", "spec", "fixture"], vendor: ["vendor", "third", "party"],
+  example: ["example", "demo"], generated: ["generated", "codegen"]
+};
+
+export function deriveQueryIntent(query: string): QueryIntent {
+  const normalized = tokens(query);
+  const values = new Set(normalized);
+  const roles = (Object.keys(ROLE_LEXICON) as QueryRole[]).filter((role) => ROLE_LEXICON[role].query.some((term) => values.has(term)));
+  const requestedAreas = (Object.keys(AREA_TERMS) as FileArea[]).filter((area) => area !== "product" && AREA_TERMS[area].some((term) => values.has(term)));
+  return { tokens: normalized, requestedAreas, roles, implementationSeeking: roles.length > 0 && requestedAreas.length === 0 };
+}
+
+type CandidateScore = readonly [number, number, number, number, number, number, number, number];
+function compareScore(left: CandidateScore, right: CandidateScore): number {
+  for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return right[index] - left[index];
+  return 0;
+}
+
+function roleFileForm(path: string, roles: readonly QueryRole[]): number {
+  const base = basename(path).replace(/\.d\.ts$|\.[^.]+$/i, "").toLowerCase();
+  if (roles.includes("cli") && base === "bin") return 1;
+  if (roles.includes("adapter") && base === "adapter") return 1;
+  if (roles.includes("compaction") && base === "index") return 1;
+  return 0;
+}
+
 export function queryRepositoryIndex(index: RepositoryIndex, query: string, options: { maxCharacters?: 4_000 | 8_000; limit?: number } = {}): RepoMapResult {
   const maxCharacters = options.maxCharacters ?? 8_000, limit = options.limit ?? 8;
   if (!query.trim() || !Number.isInteger(limit) || limit < 1 || limit > 8) throw new Error("Repo Map query and limit are invalid");
-  const queryTokens = new Set(tokens(query));
+  const intent = deriveQueryIntent(query);
+  const queryTokens = new Set(intent.tokens);
   const ranked = index.files.map((file) => {
     const symbolTokens = new Set(file.symbols.flatMap((item) => tokens(item.name)).concat(file.exports.flatMap(tokens)));
     const pathTokens = new Set(tokens(file.path));
-    const exact = file.symbols.some((item) => queryTokens.has(item.name.toLowerCase())) || file.exports.some((item) => queryTokens.has(item.toLowerCase()));
+    const packageTokens = new Set(tokens(`${file.packageName ?? ""} ${file.packageRoot}`));
+    const exact = file.symbols.some((item) => {
+      const nameTokens = tokens(item.name);
+      return nameTokens.length > 0 && nameTokens.every((term) => queryTokens.has(term));
+    }) || file.exports.some((item) => {
+      const nameTokens = tokens(item);
+      return nameTokens.length > 0 && nameTokens.every((term) => queryTokens.has(term));
+    });
     const symbolMatches = overlap(queryTokens, symbolTokens), pathMatches = overlap(queryTokens, pathTokens);
-    return { file, score: [Number(exact), symbolMatches, pathMatches, Number(index.entryCandidates.includes(file.path)), index.incoming.get(file.path)?.length ?? 0] as const };
+    const area = intent.requestedAreas.includes(file.area) || (intent.implementationSeeking && file.area === "product");
+    const role = intent.roles.filter((item) => ROLE_LEXICON[item].match.some((term) => pathTokens.has(term) || symbolTokens.has(term))).length;
+    const packageMatches = overlap(queryTokens, packageTokens);
+    const form = roleFileForm(file.path, intent.roles);
+    return { file, score: [Number(area), role, packageMatches, form, Number(exact), symbolMatches, pathMatches, index.incoming.get(file.path)?.length ?? 0] as CandidateScore };
   });
   ranked.sort((left, right) => {
-    for (let index = 0; index < left.score.length; index += 1) if (left.score[index] !== right.score[index]) return right.score[index] - left.score[index];
-    return left.file.path.localeCompare(right.file.path);
+    return compareScore(left.score, right.score) || left.file.path.localeCompare(right.file.path);
   });
-  const seeds = ranked.filter((item) => item.score[0] || item.score[1] || item.score[2]);
+  const seeds = ranked.filter((item) => item.score[1] || item.score[2] || item.score[4] || item.score[5] || item.score[6]);
   const selected: Array<{ file: FileInfo; reasons: string[] }> = [];
   if (!seeds.length) {
     for (const path of index.entryCandidates) {
@@ -280,7 +389,19 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
     }
   } else {
     for (const item of seeds) {
-      const reasons = [item.score[0] ? "exact symbol match" : "", item.score[1] ? "symbol match" : "", item.score[2] ? "path match" : ""].filter(Boolean);
+      const roleReason = intent.roles.find((role) => ROLE_LEXICON[role].match.some((term) => {
+        return tokens(item.file.path).includes(term) || item.file.symbols.some((symbol) => tokens(symbol.name).includes(term));
+      })) ?? "match";
+      const reasons = [
+        item.score[0] ? `scope: ${item.file.area}` : "",
+        item.score[1] ? `role: ${roleReason}` : "",
+        item.score[2] ? `package: ${item.file.packageName ?? item.file.packageRoot}` : "",
+        item.score[3] ? "role file form" : "",
+        item.score[4] ? "exact symbol match" : "",
+        item.score[5] ? "symbol match" : "",
+        item.score[6] ? "path match" : "",
+        item.score[7] ? "dependency" : ""
+      ].filter(Boolean).slice(0, 3);
       selected.push({ file: item.file, reasons });
     }
     const seedPaths = new Set(selected.map((item) => item.file.path));
@@ -291,18 +412,24 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
       if (file) selected.push({ file, reasons: ["one-hop dependency"] });
     }
   }
+  const confidence = !seeds.length ? "fallback" : (() => {
+    const top = seeds[0]!.score, next = seeds[1]?.score;
+    const broadOnly = !top[0] && !top[1] && !top[2] && !top[3] && !top[4];
+    return broadOnly || (next !== undefined && compareScore(top, next) === 0) ? "ambiguous" : "high";
+  })();
   const eligibleCount = selected.length;
-  const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
+  const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, area: file.area, packageRoot: file.packageRoot, ...(file.packageName ? { packageName: file.packageName } : {}), reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
   let mapTruncated = eligibleCount > candidates.length;
-  const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map((item) => item.path), "", "DEPENDENCIES"];
+  const label = (item: RepoMapCandidate) => `${item.path}  [${item.area} · package ${item.packageName ?? item.packageRoot}]`;
+  const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map(label), "", "DEPENDENCIES"];
   for (const candidate of candidates) for (const target of candidate.outgoing) if (candidates.some((item) => item.path === target)) optional.push(`${candidate.path} -> ${target}`);
   optional.push("", "SYMBOLS");
   for (const candidate of candidates) {
-    optional.push(candidate.path);
+    optional.push(label(candidate));
     for (const item of candidate.symbols) optional.push(`  ${item.kind} ${item.signature} · line ${item.location.line}`);
     optional.push(`  reason: ${candidate.reasons.join("; ")}`);
   }
-  const scope = () => ["", "SCOPE", "source bodies not inspected", "unsupported import resolution: aliases, packages, dynamic imports", `index truncated: ${index.truncated ? "yes" : "no"}`, `map truncated: ${mapTruncated ? "yes" : "no"}`];
+  const scope = () => ["", "SCOPE", `confidence: ${confidence}`, "source bodies not inspected", "unsupported import resolution: aliases, packages, dynamic imports", `index truncated: ${index.truncated ? "yes" : "no"}`, `map truncated: ${mapTruncated ? "yes" : "no"}`];
   const kept: string[] = [];
   for (const line of optional) {
     const candidateText = [...kept, line, ...scope()].join("\n");
@@ -311,7 +438,7 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
   }
   let text = [...kept, ...scope()].join("\n");
   while (text.length > maxCharacters && kept.length) { kept.pop(); mapTruncated = true; text = [...kept, ...scope()].join("\n"); }
-  return { query, candidates, text, mapTruncated };
+  return { query, candidates, text, confidence, mapTruncated };
 }
 
 function capCodePoints(value: string, limit: number): string { return [...value].slice(0, limit).join(""); }
