@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createLLM, listModels, ProviderDiagnostic, type ProviderClient } from "../src/llm.js";
+import { createLLM, listModels, ProviderDiagnostic, type LLMTelemetryEvent, type ProviderClient } from "../src/llm.js";
 
 function fakeClient(reply: unknown, models: string[] = ["z", "a", "z"]): ProviderClient & { requests: unknown[] } {
   const requests: unknown[] = [];
@@ -55,6 +55,28 @@ test("DeepSeek requests disable thinking explicitly", async () => {
   const client = fakeClient({ choices: [{ message: { content: "ok", tool_calls: [] } }] });
   await createLLM({ provider: "deepseek", model: "deepseek-chat", apiKey: "secret" }, client).generate([{ role: "user", content: "hi" }], []);
   assert.deepEqual(client.requests, [{ model: "deepseek-chat", messages: [{ role: "user", content: "hi" }], tools: [], extra_body: { thinking: { type: "disabled" } } }]);
+});
+
+test("LLM telemetry reports allowlisted usage and cannot affect generation", async () => {
+  const events: LLMTelemetryEvent[] = [];
+  const client = fakeClient({ choices: [{ message: { content: "ok", tool_calls: [] } }], usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15, request_id: "secret" } });
+  const result = await createLLM({ provider: "deepseek", model: "deepseek-v4-flash", apiKey: "secret" }, client, (event) => { events.push(event); throw new Error("observer failure"); }).generate([], []);
+  assert.equal(result.message.content, "ok");
+  assert.deepEqual(events.map(({ durationMs: _duration, ...event }) => event), [{ provider: "deepseek", model: "deepseek-v4-flash", outcome: "success", usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 } }]);
+  assert(events[0]!.durationMs >= 0);
+  assert(!JSON.stringify(events).includes("secret"));
+  const malformed: LLMTelemetryEvent[] = [];
+  await createLLM({ provider: "openai", model: "test", apiKey: "secret" }, fakeClient({ choices: [{ message: { content: "ok" } }], usage: { prompt_tokens: -1, completion_tokens: "bad" } }), (event) => malformed.push(event)).generate([], []);
+  assert.equal(malformed[0]?.usage, undefined);
+});
+
+test("LLM telemetry emits a safe failure event", async () => {
+  const events: LLMTelemetryEvent[] = [];
+  const client = fakeClient({});
+  client.chat.completions.create = async () => { throw Object.assign(new Error("key secret request body"), { status: 429, request_id: "req-secret" }); };
+  await assert.rejects(() => createLLM({ provider: "deepseek", model: "x", apiKey: "secret" }, client, (event) => events.push(event)).generate([], []));
+  assert.deepEqual(events.map(({ durationMs: _duration, ...event }) => event), [{ provider: "deepseek", model: "x", outcome: "failure" }]);
+  assert(!JSON.stringify(events).includes("secret"));
 });
 
 test("classifies provider failures without retaining unsafe exception text", async () => {
