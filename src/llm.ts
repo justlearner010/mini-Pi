@@ -34,6 +34,15 @@ export interface LLMTelemetryEvent {
   usage?: ProviderUsage;
 }
 export type LLMTelemetry = (event: LLMTelemetryEvent) => void;
+export class LiveEvaluationBudgetExceeded extends Error { constructor() { super("Live evaluation request budget exhausted"); this.name = "LiveEvaluationBudgetExceeded"; } }
+export function withRequestBudget(llm: LLMClient, maxRequests: number): { llm: LLMClient; requestsStarted: () => number } {
+  if (!Number.isSafeInteger(maxRequests) || maxRequests < 1) throw new Error("Live evaluation request budget must be positive");
+  let started = 0;
+  return {
+    llm: { async generate(messages, tools) { if (started === maxRequests) throw new LiveEvaluationBudgetExceeded(); started += 1; return llm.generate(messages, tools); } },
+    requestsStarted: () => started
+  };
+}
 
 export interface ProviderClient {
   chat: { completions: { create(request: unknown): Promise<unknown> } };

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createLLM, listModels, ProviderDiagnostic, type LLMTelemetryEvent, type ProviderClient } from "../src/llm.js";
+import { createLLM, listModels, LiveEvaluationBudgetExceeded, ProviderDiagnostic, withRequestBudget, type LLMTelemetryEvent, type ProviderClient } from "../src/llm.js";
 
 function fakeClient(reply: unknown, models: string[] = ["z", "a", "z"]): ProviderClient & { requests: unknown[] } {
   const requests: unknown[] = [];
@@ -77,6 +77,15 @@ test("LLM telemetry emits a safe failure event", async () => {
   await assert.rejects(() => createLLM({ provider: "deepseek", model: "x", apiKey: "secret" }, client, (event) => events.push(event)).generate([], []));
   assert.deepEqual(events.map(({ durationMs: _duration, ...event }) => event), [{ provider: "deepseek", model: "x", outcome: "failure" }]);
   assert(!JSON.stringify(events).includes("secret"));
+});
+
+test("live evaluation request budget blocks the twenty-first call before delegation", async () => {
+  let delegated = 0;
+  const budget = withRequestBudget({ async generate() { delegated += 1; return { message: { role: "assistant", content: "ok", toolCalls: [] } }; } }, 20);
+  for (let index = 0; index < 20; index += 1) await budget.llm.generate([], []);
+  await assert.rejects(() => budget.llm.generate([], []), LiveEvaluationBudgetExceeded);
+  assert.equal(budget.requestsStarted(), 20);
+  assert.equal(delegated, 20);
 });
 
 test("classifies provider failures without retaining unsafe exception text", async () => {
