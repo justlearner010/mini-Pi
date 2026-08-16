@@ -122,3 +122,5 @@ npm run verify:repo-map
 ```
 
 实验使用固定假模型轨迹，只验证候选定位、上下文边界和工具探索量；它不证明真实 Provider token、价格或端到端延迟已经下降。完整结果见 [Issue #9 实验报告](docs/experiments/9-query-aware-repo-map.md)。
+
+在外部大型 monorepo `deepseek-harness` 上的双轨评估显示，当前简单词面 Ranking 尚不能可靠定位五个核心实现；该负面结果与 scope / Ranking 改进建议见 [外部评估报告](docs/experiments/10-deepseek-harness-repo-map-evaluation.md)。
