@@ -12,7 +12,8 @@ export type TuiSession = { agent: Agent; provider: ProviderName; model: string }
 export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined> };
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
-export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer };
+export type RepositoryIndexStatus = { available: boolean; indexedFiles: number; skippedFiles: number; truncated: boolean };
+export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer; runAgent?: (agent: Agent, prompt: string) => ReturnType<Agent["run"]> };
 export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; provider?: ProviderName; model?: string; debug?: boolean; renderMarkdown?: MarkdownRenderer };
 
 const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", approval: "\x1b[38;5;179m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
@@ -98,6 +99,11 @@ export class TuiView {
   }
 
   hasHandledError(): boolean { return this.errorHandled || Boolean(this.pendingError); }
+
+  repositoryIndexStatus(status: RepositoryIndexStatus): void {
+    const text = status.available ? `Repository index · ${Math.max(0, status.indexedFiles)} files · ${Math.max(0, status.skippedFiles)} skipped · ${status.truncated ? "truncated" : "complete"}` : "Repository index unavailable · using on-demand tools";
+    this.writeLayer("activity", sanitizePlainText(text));
+  }
 
   renderUnhandledError(message: string): void {
     this.pendingError = { type: "error", stage: "agent", message };
@@ -281,11 +287,12 @@ export function helpText(project: string, provider: ProviderName, model: string)
   return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /help, /reset, /exit`;
 }
 
-export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string }, actions?: TuiActions, runtime: TuiRuntime = {}, view = new TuiView({ write: runtime.write ?? ((text) => { stdout.write(text); }), provider: config.provider, model: config.model, renderMarkdown: runtime.renderMarkdown })): Promise<number> {
+export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string; repositoryIndexStatus?: RepositoryIndexStatus }, actions?: TuiActions, runtime: TuiRuntime = {}, view = new TuiView({ write: runtime.write ?? ((text) => { stdout.write(text); }), provider: config.provider, model: config.model, renderMarkdown: runtime.renderMarkdown })): Promise<number> {
   const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
   const write = runtime.write ?? ((text: string) => { stdout.write(text); });
   let session: TuiSession = { agent, provider: config.provider, model: config.model };
   write("mini-Pi ready. /help for commands.\n");
+  if (config.repositoryIndexStatus) view.repositoryIndexStatus(config.repositoryIndexStatus);
   while (true) {
     const line = createLine();
     let input: string;
@@ -312,7 +319,7 @@ export async function startTui(agent: Agent, config: { project: string; provider
       }
       if (command.type !== "prompt") continue;
       try {
-        const result = await session.agent.run(command.prompt);
+        const result = await (runtime.runAgent ? runtime.runAgent(session.agent, command.prompt) : session.agent.run(command.prompt));
         view.renderTurn(command.prompt, result.answer, result.turns);
       }
       catch (error) {

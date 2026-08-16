@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { Agent, type AgentEvent, type RequestApproval } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
-import { tools } from "./tool.js";
+import { buildRepositoryIndex, createQueryRepoMapTool, queryRepositoryIndex, tools, type RepoMapResult, type RepositoryIndex, type Tool } from "./tool.js";
 import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, TuiView, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
@@ -23,7 +23,20 @@ export interface CredentialStore {
 export type GlobalPreference = { provider: ProviderName; model: string };
 export type KeySource = "environment" | "credential-store";
 export type StartupSelection = GlobalPreference & { apiKey: string; keySource: KeySource };
+export interface RepositoryNavigation { index: RepositoryIndex; tools: Tool[]; mapFor(query: string, maxCharacters?: 4_000 | 8_000): RepoMapResult; }
 export const CREDENTIAL_SERVICE = "mini-Pi";
+export const AUTO_REPO_MAP_MAX_CHARACTERS = 4_000;
+export async function createRepositoryNavigation(rootDir: string): Promise<RepositoryNavigation | undefined> {
+  try {
+    const index = await buildRepositoryIndex(rootDir);
+    return { index, tools: [...tools, createQueryRepoMapTool(index)], mapFor: (query, maxCharacters = AUTO_REPO_MAP_MAX_CHARACTERS) => queryRepositoryIndex(index, query, { maxCharacters, limit: 8 }) };
+  } catch { return undefined; }
+}
+
+export function runWithNavigation(agent: Pick<Agent, "run">, prompt: string, navigation?: RepositoryNavigation): ReturnType<Agent["run"]> {
+  const transientContext = navigation?.mapFor(prompt).text;
+  return transientContext ? agent.run(prompt, { transientContext }) : agent.run(prompt);
+}
 export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
 const require = createRequire(import.meta.url);
 
@@ -187,6 +200,12 @@ If a tool result is truncated or incomplete, say so and narrow the
 analysis scope when possible.
 
 Answer in the user's language.
+If current-run repository navigation context identifies a plausible candidate,
+read that candidate instead of scanning the whole project. Call query_repo_map
+once with a more precise query only when candidates are absent, ambiguous, or
+conflict with inspected evidence. Repo Map metadata is navigation evidence,
+not proof of function-body behavior.
+
 For full-project analysis, include:
 - a short project overview;
 - the directory structure;
@@ -194,12 +213,12 @@ For full-project analysis, include:
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
 function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
-function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
-  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
+function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, agentTools: Tool[], onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
+  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools: agentTools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
 }
 
-export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log): Promise<number> {
-  try { write((await agent.run(prompt)).answer); return 0; }
+export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log, navigation?: RepositoryNavigation): Promise<number> {
+  try { write((await runWithNavigation(agent, prompt, navigation)).answer); return 0; }
   catch { return 1; }
 }
 
@@ -232,21 +251,24 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
   const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
+  const navigation = await createRepositoryNavigation(valid.rootDir!);
+  const agentTools = navigation?.tools ?? tools;
   if (valid.prompt) {
-    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, (event) => {
+    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, agentTools, (event) => {
       const text = formatEvent(event, debugEnabled(env));
       if (text) console.log(text);
     }, requestApproval);
-    return runOneShot(agent, valid.prompt);
+    return runOneShot(agent, valid.prompt, console.log, navigation);
   }
   const view = new TuiView({ write: (text) => process.stdout.write(text), provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, view.onEvent.bind(view), requestApproval, history) });
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, agentTools, view.onEvent.bind(view), requestApproval, history) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
-  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model }, {
+  const skippedFiles = navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0;
+  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model, repositoryIndexStatus: { available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles, truncated: navigation?.index.truncated ?? false } }, {
     login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
     model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.agent.history()); },
     logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference)
-  }, {}, view);
+  }, { runAgent: (agent, prompt) => runWithNavigation(agent, prompt, navigation) }, view);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) run().then((code) => { process.exitCode = code; });

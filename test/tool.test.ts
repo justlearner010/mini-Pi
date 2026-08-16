@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, findCycles, readFileTool, scanProjectTool } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, createQueryRepoMapTool, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -28,6 +28,195 @@ async function analyze(rootDir: string, args: Record<string, unknown> = {}) {
   assert.equal(result.isError, false);
   return result.content as Record<string, unknown>;
 }
+
+test("repository discovery honors gitignore, hard excludes, and source kinds", async () => {
+  const rootDir = await project({
+    ".gitignore": "ignored/*\n!ignored/keep.ts\n*.generated.ts\n",
+    "src/a.ts": "export const a = 1",
+    "src/view.tsx": "export const View = () => null",
+    "src/legacy.js": "export const legacy = 1",
+    "src/widget.jsx": "export const Widget = () => null",
+    "types/api.d.ts": "export interface Api {}",
+    "ignored/drop.ts": "export const drop = 1",
+    "ignored/keep.ts": "export const keep = 1",
+    "src/skip.generated.ts": "export const generated = 1",
+    "node_modules/pkg/index.ts": "export const dependency = 1",
+    "dist/out.js": "export const built = 1",
+    ".cache/hidden.ts": "export const hidden = 1",
+    "script.py": "print('unsupported')"
+  });
+  const result = await discoverRepositorySources(rootDir);
+  assert.deepEqual(result.files.map((file) => [file.path, file.sourceKind]), [
+    ["ignored/keep.ts", "ts"], ["src/a.ts", "ts"], ["src/legacy.js", "js"],
+    ["src/view.tsx", "tsx"], ["src/widget.jsx", "jsx"], ["types/api.d.ts", "dts"]
+  ]);
+  assert.equal(result.unsupportedLanguageFiles, 1);
+  assert.equal(result.truncated, false);
+});
+
+test("repository discovery records file-size and total-byte bounds", async () => {
+  assert.deepEqual(REPOSITORY_INDEX_LIMITS, { maxFiles: 5_000, maxFileBytes: 512 * 1024, maxTotalBytes: 50 * 1024 * 1024 });
+  const limits: RepositoryIndexLimits = { maxFiles: 10, maxFileBytes: 4, maxTotalBytes: 6 };
+  const result = await discoverRepositorySources(await project({ "a.ts": "1234", "b.ts": "56", "c.ts": "7", "large.ts": "12345" }), limits);
+  assert.deepEqual(result.files.map((file) => file.path), ["a.ts", "b.ts"]);
+  assert.deepEqual(result.skipped, { fileLimit: 0, fileTooLarge: 1, totalBytes: 1, readError: 0 });
+  assert.equal(result.inspectedBytes, 6);
+  assert.equal(result.truncated, true);
+});
+
+test("repository discovery records the file-count boundary and nested gitignore scope", async () => {
+  const result = await discoverRepositorySources(await project({
+    "a.ts": "a", "b.ts": "b", "c.ts": "c", "nested/.gitignore": "ignored.ts\n", "nested/ignored.ts": "ignored"
+  }), { maxFiles: 2, maxFileBytes: 10, maxTotalBytes: 20 });
+  assert.deepEqual(result.files.map((file) => file.path), ["a.ts", "b.ts"]);
+  assert.equal(result.skipped.fileLimit, 2);
+  assert.equal(result.nestedGitignoreFiles, 1);
+  assert.equal(result.truncated, true);
+});
+
+test("repository discovery never follows file or directory symlinks", async () => {
+  const outside = await project({ "secret.ts": "secret" });
+  const rootDir = await project({ "inside.ts": "inside", "real/nested.ts": "nested" });
+  await symlink(join(outside, "secret.ts"), join(rootDir, "outside.ts"));
+  await symlink(join(rootDir, "real"), join(rootDir, "linked"));
+  const result = await discoverRepositorySources(rootDir);
+  assert.deepEqual(result.files.map((file) => file.path), ["inside.ts", "real/nested.ts"]);
+});
+
+test("repository index extracts syntax metadata without bodies or private methods", async () => {
+  const rootDir = await project({
+    "src/agent.ts": `import type { Tool } from "./tool.js";
+import OpenAI from "openai";
+export { helper } from "./helper.js";
+export interface AgentConfig { tools: Tool[] }
+export type Mode = "fast" | "safe";
+export enum State { Ready }
+export const secret = "DO_NOT_INDEX_INITIALIZER";
+export function createAgent(config: AgentConfig): Agent { return new Agent(config); }
+export default class Agent {
+  constructor(config: AgentConfig) {}
+  run(prompt: string): Promise<void> { return Promise.resolve(); }
+  protected prepare(): void {}
+  private leak(): string { return "DO_NOT_INDEX_BODY"; }
+}
+const lazy = import("./lazy.js");
+import alias from "@/alias.js";`,
+    "src/tool.ts": "export interface Tool { name: string }",
+    "src/helper.ts": "export const helper = 1"
+  });
+  const index = await buildRepositoryIndex(rootDir);
+  const agent = index.files.find((file) => file.path === "src/agent.ts")!;
+  assert(agent);
+  assert.deepEqual(agent.imports.map(({ specifier, kind, resolvedPath, exported }) => ({ specifier, kind, resolvedPath, exported })), [
+    { specifier: "./helper.js", kind: "relative", resolvedPath: "src/helper.ts", exported: true },
+    { specifier: "./lazy.js", kind: "dynamic", resolvedPath: undefined, exported: false },
+    { specifier: "./tool.js", kind: "relative", resolvedPath: "src/tool.ts", exported: false },
+    { specifier: "@/alias.js", kind: "alias", resolvedPath: undefined, exported: false },
+    { specifier: "openai", kind: "package", resolvedPath: undefined, exported: false }
+  ]);
+  const symbols = agent.symbols.map((symbol) => `${symbol.kind}:${symbol.name}`);
+  for (const expected of ["class:Agent", "method:constructor", "method:run", "function:createAgent", "interface:AgentConfig", "type:Mode", "enum:State", "variable:secret"]) assert(symbols.includes(expected), `${expected} missing from ${symbols.join(", ")}`);
+  const serialized = JSON.stringify(agent);
+  assert(!serialized.includes("DO_NOT_INDEX_INITIALIZER"));
+  assert(!serialized.includes("DO_NOT_INDEX_BODY"));
+  assert(!serialized.includes("prepare"));
+  assert(!serialized.includes("leak"));
+  assert.deepEqual(index.outgoing.get("src/agent.ts"), ["src/helper.ts", "src/tool.ts"]);
+  assert.deepEqual(index.incoming.get("src/tool.ts"), ["src/agent.ts"]);
+});
+
+test("repository index derives exact entry basenames and caps signatures", async () => {
+  const longParameters = Array.from({ length: 80 }, (_, index) => `value${index}: string`).join(", ");
+  const index = await buildRepositoryIndex(await project({
+    "src/index.ts": `export function long(${longParameters}): void {}`,
+    "src/application.ts": "export const application = true",
+    "src/cli.ts": "export const cli = true"
+  }));
+  assert.deepEqual(index.entryCandidates, ["src/cli.ts", "src/index.ts"]);
+  const signature = index.files.find((file) => file.path === "src/index.ts")!.symbols[0];
+  assert.equal(signature.signature.length, 240);
+  assert.equal(signature.signatureTruncated, true);
+  assert.deepEqual(signature.location, { line: 1, column: 1 });
+});
+
+test("repository index gives anonymous default declarations stable nonempty signatures", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "class.ts": "export default class {}",
+    "function.ts": "export default function (): void {}"
+  }));
+  const symbols = index.files.flatMap((file) => file.symbols);
+  const anonymousClass = symbols.find((item) => item.name === "default class")!;
+  const anonymousFunction = symbols.find((item) => item.name === "default function")!;
+  assert.match(anonymousClass.signature, /export default class/);
+  assert.match(anonymousFunction.signature, /export default function/);
+  assert.equal(anonymousClass.exported, true);
+  assert.equal(anonymousFunction.exported, true);
+});
+
+test("queryRepositoryIndex locates the five declared navigation targets", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "src/cli.ts": `import { Agent } from "./agent.js"; import { createLLM } from "./llm.js"; export function runCli(): void {}`,
+    "src/agent.ts": `import type { Tool } from "./tool.js"; import type { LLMClient } from "./llm.js"; export class Agent { run(prompt: string): Promise<void> { return Promise.resolve(); } }`,
+    "src/tool.ts": `export interface Tool { execute(args: unknown): Promise<void> } export class ToolRegistry { execute(name: string): Promise<void> { return Promise.resolve(); } }`,
+    "src/llm.ts": `export interface LLMProviderConfig { provider: string } export interface LLMClient {} export function createLLM(config: LLMProviderConfig): LLMClient { return {}; }`
+  }));
+  const cases = [
+    ["Where is CLI handling implemented?", "src/cli.ts"],
+    ["Which module defines the LLM provider?", "src/llm.ts"],
+    ["Where is tool execution handled?", "src/tool.ts"],
+    ["Which modules depend on Agent?", "src/agent.ts"],
+    ["Where should I inspect provider configuration?", "src/llm.ts"]
+  ] as const;
+  let top1 = 0;
+  for (const [query, expected] of cases) {
+    const result = queryRepositoryIndex(index, query, { maxCharacters: 8_000, limit: 8 });
+    assert(result.candidates.slice(0, 3).some((candidate) => candidate.path === expected), `${expected} missing for ${query}`);
+    if (result.candidates[0]?.path === expected) top1 += 1;
+    assert.match(result.text, /REPO MAP/);
+    assert.match(result.text, /source bodies not inspected/);
+    assert.match(result.text, /index truncated: no/);
+    assert.match(result.text, /map truncated: no/);
+  }
+  assert(top1 >= 4, `only ${top1}/5 Top-1 matches`);
+});
+
+test("queryRepositoryIndex expands one hop, falls back to entries, and caps complete lines", async () => {
+  const index = await buildRepositoryIndex(await project({
+    "src/index.ts": `import { target } from "./target.js"; export const start = target`,
+    "src/target.ts": `export function target(): void {}`,
+    ...Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`src/neighbor-${String(index).padStart(3, "0")}.ts`, `import { target } from "./target.js"; export const n${index} = target`]))
+  }));
+  const matched = queryRepositoryIndex(index, "target", { maxCharacters: 4_000, limit: 8 });
+  assert.equal(matched.candidates[0].path, "src/target.ts");
+  assert(matched.candidates.slice(1).some((candidate) => candidate.path === "src/index.ts"));
+  assert(matched.text.length <= 4_000);
+  assert.match(matched.text, /map truncated: yes/);
+  assert(!matched.text.endsWith("src/"));
+  const fallback = queryRepositoryIndex(index, "unrelated mystery", { maxCharacters: 8_000, limit: 1 });
+  assert.equal(fallback.candidates[0].path, "src/index.ts");
+  assert(fallback.candidates[0].reasons.includes("fallback candidate"));
+});
+
+test("query_repo_map is SAFE, strict, bounded, and index-only", async () => {
+  const index = await buildRepositoryIndex(await project({ "src/llm.ts": "export interface ProviderConfig { model: string }" }));
+  const tool = createQueryRepoMapTool(index);
+  assert.equal(tool.name, "query_repo_map");
+  assert.equal(tool.permission, "SAFE");
+  assert.deepEqual(tool.parameters, {
+    type: "object",
+    properties: { query: { type: "string", minLength: 1 }, limit: { type: "integer", minimum: 1, maximum: 8 } },
+    required: ["query"],
+    additionalProperties: false
+  });
+  const result = await tool.execute({ query: "provider", limit: 3 }, { rootDir: "/does-not-exist" });
+  assert.equal(result.isError, false);
+  assert((result.content as RepoMapResult).text.length <= 8_000);
+  assert.equal(typeof result.historyContent, "string");
+  assert([...result.historyContent!].length <= 512);
+  for (const args of [{}, { query: "" }, { query: "x", limit: 0 }, { query: "x", limit: 9 }, { query: "x", limit: 1.5 }, { query: "x", extra: true }, []]) {
+    assert.equal((await tool.execute(args, { rootDir: "/does-not-exist" })).isError, true);
+  }
+});
 
 test("scan discovers README, manifests, supported files, and stable ordering", async () => {
   const rootDir = await project({

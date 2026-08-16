@@ -1,6 +1,7 @@
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { builtinModules } from "node:module";
+import ignore from "ignore";
 import ts from "typescript";
 
 export interface ToolContext {
@@ -10,6 +11,7 @@ export interface ToolContext {
 export interface ToolResult {
   content: unknown;
   isError: boolean;
+  historyContent?: string;
 }
 
 export type ToolPermission = "SAFE" | "SENSITIVE" | "DESTRUCTIVE";
@@ -35,6 +37,315 @@ const MAX_DEPENDENCY_CYCLES = 500;
 const MAX_DEPENDENCY_CYCLE_STEPS = 100_000;
 const RESOLVABLE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 const BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, "")));
+
+export interface RepositoryIndexLimits {
+  maxFiles: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+}
+
+export const REPOSITORY_INDEX_LIMITS: RepositoryIndexLimits = {
+  maxFiles: 5_000,
+  maxFileBytes: 512 * 1024,
+  maxTotalBytes: 50 * 1024 * 1024
+};
+
+export type SourceKind = "ts" | "tsx" | "js" | "jsx" | "dts";
+export interface DiscoveredSource { path: string; sourceKind: SourceKind; bytes: number; text: string; }
+export interface RepositoryDiscovery {
+  files: DiscoveredSource[];
+  supportedFileCount: number;
+  unsupportedLanguageFiles: number;
+  nestedGitignoreFiles: number;
+  inspectedBytes: number;
+  skipped: { fileLimit: number; fileTooLarge: number; totalBytes: number; readError: number };
+  truncated: boolean;
+}
+
+function sourceKind(path: string): SourceKind | undefined {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".d.ts")) return "dts";
+  if (lower.endsWith(".tsx")) return "tsx";
+  if (lower.endsWith(".ts")) return "ts";
+  if (lower.endsWith(".jsx")) return "jsx";
+  if (lower.endsWith(".js")) return "js";
+  return undefined;
+}
+
+export async function discoverRepositorySources(rootDir: string, limits: RepositoryIndexLimits = REPOSITORY_INDEX_LIMITS): Promise<RepositoryDiscovery> {
+  if (![limits.maxFiles, limits.maxFileBytes, limits.maxTotalBytes].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error("Repository index limits must be positive integers");
+  const root = await realpath(rootDir);
+  const matcher = ignore();
+  try { matcher.add(await readFile(resolve(root, ".gitignore"), "utf8")); } catch { /* optional root ignore */ }
+  const candidates: Array<{ path: string; absolutePath: string; sourceKind: SourceKind }> = [];
+  let unsupportedLanguageFiles = 0, nestedGitignoreFiles = 0;
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const absolutePath = resolve(directory, entry.name);
+      const path = relativePath(root, absolutePath);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".") || IGNORED_DIRECTORIES.has(entry.name) || matcher.ignores(`${path}/`)) continue;
+        await visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name === ".gitignore" && directory !== root) nestedGitignoreFiles += 1;
+      if (matcher.ignores(path)) continue;
+      const kind = sourceKind(path);
+      if (kind) candidates.push({ path, absolutePath, sourceKind: kind });
+      else if (UNSUPPORTED_SOURCE_EXTENSIONS.has(extname(path).toLowerCase())) unsupportedLanguageFiles += 1;
+    }
+  };
+  await visit(root);
+  candidates.sort((left, right) => left.path.localeCompare(right.path));
+  const files: DiscoveredSource[] = [];
+  const skipped = { fileLimit: 0, fileTooLarge: 0, totalBytes: 0, readError: 0 };
+  let inspectedBytes = 0;
+  for (const candidate of candidates) {
+    if (files.length === limits.maxFiles) { skipped.fileLimit += 1; continue; }
+    try {
+      const bytes = await readFile(candidate.absolutePath);
+      if (bytes.byteLength > limits.maxFileBytes) { skipped.fileTooLarge += 1; continue; }
+      if (inspectedBytes + bytes.byteLength > limits.maxTotalBytes) { skipped.totalBytes += 1; continue; }
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      files.push({ path: candidate.path, sourceKind: candidate.sourceKind, bytes: bytes.byteLength, text });
+      inspectedBytes += bytes.byteLength;
+    } catch { skipped.readError += 1; }
+  }
+  const truncated = nestedGitignoreFiles > 0 || Object.values(skipped).some((value) => value > 0);
+  return { files, supportedFileCount: candidates.length, unsupportedLanguageFiles, nestedGitignoreFiles, inspectedBytes, skipped, truncated };
+}
+
+export interface SourceLocation { line: number; column: number; }
+export interface ImportInfo { specifier: string; kind: "relative" | "alias" | "package" | "dynamic"; resolvedPath?: string; exported: boolean; }
+export interface SymbolInfo {
+  name: string;
+  kind: "class" | "function" | "interface" | "type" | "enum" | "variable" | "method";
+  signature: string;
+  exported: boolean;
+  location: SourceLocation;
+  signatureTruncated: boolean;
+}
+export interface FileInfo { path: string; sourceKind: SourceKind; imports: ImportInfo[]; exports: string[]; symbols: SymbolInfo[]; parseDiagnostics: number; }
+export interface RepositoryIndex {
+  files: readonly FileInfo[];
+  incoming: ReadonlyMap<string, readonly string[]>;
+  outgoing: ReadonlyMap<string, readonly string[]>;
+  entryCandidates: readonly string[];
+  inspectedFileCount: number;
+  inspectedBytes: number;
+  skipped: Readonly<Record<string, number>>;
+  truncated: boolean;
+}
+
+function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  return !!ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === kind);
+}
+function declarationLocation(source: ts.SourceFile, node: ts.Node): SourceLocation {
+  const point = source.getLineAndCharacterOfPosition(node.getStart(source));
+  return { line: point.line + 1, column: point.character + 1 };
+}
+function cappedSignature(value: string): Pick<SymbolInfo, "signature" | "signatureTruncated"> {
+  const normalized = value.replace(/\s+/g, " ").trim().replace(/\s*\{$/, "");
+  return normalized.length <= 240 ? { signature: normalized, signatureTruncated: false } : { signature: `${normalized.slice(0, 239)}…`, signatureTruncated: true };
+}
+function declarationHeader(source: ts.SourceFile, node: ts.Node, body?: ts.Node): string {
+  return source.text.slice(node.getStart(source), body ? body.getStart(source) : node.getEnd()).trim();
+}
+function symbol(source: ts.SourceFile, node: ts.Node, kind: SymbolInfo["kind"], name: string, exported: boolean, signature: string): SymbolInfo {
+  return { name, kind, exported, location: declarationLocation(source, node), ...cappedSignature(signature) };
+}
+function scriptKind(kind: SourceKind): ts.ScriptKind {
+  if (kind === "tsx") return ts.ScriptKind.TSX;
+  if (kind === "jsx") return ts.ScriptKind.JSX;
+  if (kind === "js") return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS;
+}
+function importKind(specifier: string): ImportInfo["kind"] {
+  if (specifier.startsWith(".")) return "relative";
+  if (specifier.startsWith("@/") || specifier.startsWith("~/") || specifier.startsWith("#")) return "alias";
+  return "package";
+}
+
+async function indexFile(root: string, file: DiscoveredSource): Promise<FileInfo> {
+  const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, scriptKind(file.sourceKind));
+  const imports: ImportInfo[] = [], symbols: SymbolInfo[] = [], exportedNames: string[] = [];
+  for (const statement of source.statements) {
+    let specifier: string | undefined, exported = false;
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) specifier = statement.moduleSpecifier.text;
+    else if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) { specifier = statement.moduleSpecifier.text; exported = true; }
+    if (specifier) {
+      const kind = importKind(specifier);
+      const resolved = kind === "relative" ? await resolveImportPath(root, file.path, specifier) : {};
+      imports.push({ specifier, kind, ...(resolved.path ? { resolvedPath: resolved.path } : {}), exported });
+    }
+    if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) for (const item of statement.exportClause.elements) exportedNames.push(item.name.text);
+    const isExported = hasModifier(statement, ts.SyntaxKind.ExportKeyword) || hasModifier(statement, ts.SyntaxKind.DefaultKeyword);
+    if (ts.isClassDeclaration(statement)) {
+      const name = statement.name?.text ?? "default class";
+      symbols.push(symbol(source, statement, "class", name, isExported, source.text.slice(statement.getStart(source), statement.members.pos)));
+      if (isExported) {
+        exportedNames.push(name);
+        for (const member of statement.members) {
+          if (hasModifier(member, ts.SyntaxKind.PrivateKeyword) || hasModifier(member, ts.SyntaxKind.ProtectedKeyword)) continue;
+          if (ts.isConstructorDeclaration(member)) symbols.push(symbol(source, member, "method", "constructor", true, declarationHeader(source, member, member.body)));
+          else if (ts.isMethodDeclaration(member) && member.name) symbols.push(symbol(source, member, "method", member.name.getText(source), true, declarationHeader(source, member, member.body)));
+        }
+      }
+    } else if (ts.isFunctionDeclaration(statement)) {
+      const name = statement.name?.text ?? "default function";
+      symbols.push(symbol(source, statement, "function", name, isExported, declarationHeader(source, statement, statement.body)));
+      if (isExported) exportedNames.push(name);
+    } else if (ts.isInterfaceDeclaration(statement)) {
+      symbols.push(symbol(source, statement, "interface", statement.name.text, isExported, statement.getText(source)));
+      if (isExported) exportedNames.push(statement.name.text);
+    } else if (ts.isTypeAliasDeclaration(statement)) {
+      symbols.push(symbol(source, statement, "type", statement.name.text, isExported, statement.getText(source)));
+      if (isExported) exportedNames.push(statement.name.text);
+    } else if (ts.isEnumDeclaration(statement)) {
+      symbols.push(symbol(source, statement, "enum", statement.name.text, isExported, source.text.slice(statement.getStart(source), statement.members.pos)));
+      if (isExported) exportedNames.push(statement.name.text);
+    } else if (ts.isVariableStatement(statement)) {
+      const keyword = statement.declarationList.flags & ts.NodeFlags.Const ? "const" : statement.declarationList.flags & ts.NodeFlags.Let ? "let" : "var";
+      for (const declaration of statement.declarationList.declarations) if (ts.isIdentifier(declaration.name)) {
+        const signature = `${isExported ? "export " : ""}${keyword} ${declaration.name.text}${declaration.type ? `: ${declaration.type.getText(source)}` : ""}`;
+        symbols.push(symbol(source, declaration, "variable", declaration.name.text, isExported, signature));
+        if (isExported) exportedNames.push(declaration.name.text);
+      }
+    }
+  }
+  const visitDynamic = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0])) imports.push({ specifier: node.arguments[0].text, kind: "dynamic", exported: false });
+    ts.forEachChild(node, visitDynamic);
+  };
+  ts.forEachChild(source, visitDynamic);
+  imports.sort((left, right) => left.specifier.localeCompare(right.specifier) || left.kind.localeCompare(right.kind));
+  symbols.sort((left, right) => left.kind.localeCompare(right.kind) || left.name.localeCompare(right.name));
+  exportedNames.sort((left, right) => left.localeCompare(right));
+  return { path: file.path, sourceKind: file.sourceKind, imports, exports: [...new Set(exportedNames)], symbols, parseDiagnostics: (source as unknown as { parseDiagnostics: readonly unknown[] }).parseDiagnostics.length };
+}
+
+export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIndexLimits = REPOSITORY_INDEX_LIMITS): Promise<RepositoryIndex> {
+  const root = await realpath(rootDir);
+  const discovery = await discoverRepositorySources(root, limits);
+  const files = await Promise.all(discovery.files.map((file) => indexFile(root, file)));
+  const fileNames = new Set(files.map((file) => file.path));
+  const outgoing = new Map<string, string[]>(), incoming = new Map<string, string[]>();
+  for (const file of files) { outgoing.set(file.path, []); incoming.set(file.path, []); }
+  for (const file of files) for (const item of file.imports) if (item.resolvedPath && fileNames.has(item.resolvedPath)) {
+    if (!outgoing.get(file.path)!.includes(item.resolvedPath)) outgoing.get(file.path)!.push(item.resolvedPath);
+    if (!incoming.get(item.resolvedPath)!.includes(file.path)) incoming.get(item.resolvedPath)!.push(file.path);
+  }
+  for (const paths of [...outgoing.values(), ...incoming.values()]) paths.sort((left, right) => left.localeCompare(right));
+  const entryCandidates = files.map((file) => file.path).filter((path) => ["index", "main", "server", "app", "cli"].includes(path.replace(/\.d\.ts$|\.[^.]+$/i, "").split("/").at(-1) ?? "")).sort((left, right) => left.localeCompare(right));
+  return { files, incoming, outgoing, entryCandidates, inspectedFileCount: files.length, inspectedBytes: discovery.inspectedBytes, skipped: Object.freeze({ ...discovery.skipped, nestedGitignore: discovery.nestedGitignoreFiles, unsupportedLanguage: discovery.unsupportedLanguageFiles }), truncated: discovery.truncated };
+}
+
+export interface RepoMapCandidate { path: string; reasons: string[]; symbols: SymbolInfo[]; incoming: string[]; outgoing: string[]; }
+export interface RepoMapResult { query: string; candidates: RepoMapCandidate[]; text: string; mapTruncated: boolean; }
+
+function tokens(value: string): string[] {
+  return value.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+function overlap(left: Set<string>, right: Set<string>): number {
+  let count = 0;
+  for (const item of left) if (right.has(item)) count += 1;
+  return count;
+}
+
+export function queryRepositoryIndex(index: RepositoryIndex, query: string, options: { maxCharacters?: 4_000 | 8_000; limit?: number } = {}): RepoMapResult {
+  const maxCharacters = options.maxCharacters ?? 8_000, limit = options.limit ?? 8;
+  if (!query.trim() || !Number.isInteger(limit) || limit < 1 || limit > 8) throw new Error("Repo Map query and limit are invalid");
+  const queryTokens = new Set(tokens(query));
+  const ranked = index.files.map((file) => {
+    const symbolTokens = new Set(file.symbols.flatMap((item) => tokens(item.name)).concat(file.exports.flatMap(tokens)));
+    const pathTokens = new Set(tokens(file.path));
+    const exact = file.symbols.some((item) => queryTokens.has(item.name.toLowerCase())) || file.exports.some((item) => queryTokens.has(item.toLowerCase()));
+    const symbolMatches = overlap(queryTokens, symbolTokens), pathMatches = overlap(queryTokens, pathTokens);
+    return { file, score: [Number(exact), symbolMatches, pathMatches, Number(index.entryCandidates.includes(file.path)), index.incoming.get(file.path)?.length ?? 0] as const };
+  });
+  ranked.sort((left, right) => {
+    for (let index = 0; index < left.score.length; index += 1) if (left.score[index] !== right.score[index]) return right.score[index] - left.score[index];
+    return left.file.path.localeCompare(right.file.path);
+  });
+  const seeds = ranked.filter((item) => item.score[0] || item.score[1] || item.score[2]);
+  const selected: Array<{ file: FileInfo; reasons: string[] }> = [];
+  if (!seeds.length) {
+    for (const path of index.entryCandidates) {
+      const file = index.files.find((item) => item.path === path);
+      if (file) selected.push({ file, reasons: ["fallback candidate"] });
+    }
+  } else {
+    for (const item of seeds) {
+      const reasons = [item.score[0] ? "exact symbol match" : "", item.score[1] ? "symbol match" : "", item.score[2] ? "path match" : ""].filter(Boolean);
+      selected.push({ file: item.file, reasons });
+    }
+    const seedPaths = new Set(selected.map((item) => item.file.path));
+    const neighbors = new Set<string>();
+    for (const path of seedPaths) for (const neighbor of [...(index.incoming.get(path) ?? []), ...(index.outgoing.get(path) ?? [])]) if (!seedPaths.has(neighbor)) neighbors.add(neighbor);
+    for (const path of [...neighbors].sort((left, right) => left.localeCompare(right))) {
+      const file = index.files.find((item) => item.path === path);
+      if (file) selected.push({ file, reasons: ["one-hop dependency"] });
+    }
+  }
+  const eligibleCount = selected.length;
+  const candidates = selected.slice(0, limit).map(({ file, reasons }) => ({ path: file.path, reasons, symbols: file.symbols, incoming: [...(index.incoming.get(file.path) ?? [])], outgoing: [...(index.outgoing.get(file.path) ?? [])] }));
+  let mapTruncated = eligibleCount > candidates.length;
+  const optional = ["REPO MAP", `query: ${query}`, `indexed: ${index.inspectedFileCount}/${index.inspectedFileCount + Object.values(index.skipped).reduce((sum, value) => sum + value, 0)} supported files · ${Math.ceil(index.inspectedBytes / 1024)} KiB`, "", "FILES", ...candidates.map((item) => item.path), "", "DEPENDENCIES"];
+  for (const candidate of candidates) for (const target of candidate.outgoing) if (candidates.some((item) => item.path === target)) optional.push(`${candidate.path} -> ${target}`);
+  optional.push("", "SYMBOLS");
+  for (const candidate of candidates) {
+    optional.push(candidate.path);
+    for (const item of candidate.symbols) optional.push(`  ${item.kind} ${item.signature} · line ${item.location.line}`);
+    optional.push(`  reason: ${candidate.reasons.join("; ")}`);
+  }
+  const scope = () => ["", "SCOPE", "source bodies not inspected", "unsupported import resolution: aliases, packages, dynamic imports", `index truncated: ${index.truncated ? "yes" : "no"}`, `map truncated: ${mapTruncated ? "yes" : "no"}`];
+  const kept: string[] = [];
+  for (const line of optional) {
+    const candidateText = [...kept, line, ...scope()].join("\n");
+    if (candidateText.length <= maxCharacters) kept.push(line);
+    else mapTruncated = true;
+  }
+  let text = [...kept, ...scope()].join("\n");
+  while (text.length > maxCharacters && kept.length) { kept.pop(); mapTruncated = true; text = [...kept, ...scope()].join("\n"); }
+  return { query, candidates, text, mapTruncated };
+}
+
+function capCodePoints(value: string, limit: number): string { return [...value].slice(0, limit).join(""); }
+
+export function createQueryRepoMapTool(index: RepositoryIndex): Tool {
+  return {
+    name: "query_repo_map",
+    description: "Find candidate TypeScript and JavaScript files and declarations in the prebuilt repository index.",
+    permission: "SAFE",
+    reason: "Only queries bounded metadata already read from the configured project root.",
+    risk: "low",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", minLength: 1 }, limit: { type: "integer", minimum: 1, maximum: 8 } },
+      required: ["query"],
+      additionalProperties: false
+    },
+    async execute(args) {
+      try {
+        if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some((key) => key !== "query" && key !== "limit")) throw new Error("Arguments must contain only query and limit");
+        const input = args as { query?: unknown; limit?: unknown };
+        if (typeof input.query !== "string" || !input.query.trim()) throw new Error("Query must be a nonempty string");
+        const limit = input.limit ?? 8;
+        if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 8) throw new Error("Limit must be an integer from 1 to 8");
+        const content = queryRepositoryIndex(index, input.query, { maxCharacters: 8_000, limit: limit as number });
+        const paths = content.candidates.map((candidate) => candidate.path).join(", ") || "none";
+        const historyContent = capCodePoints(`Repo map candidates: ${paths}; index truncated: ${index.truncated ? "yes" : "no"}; map truncated: ${content.mapTruncated ? "yes" : "no"}`, 512);
+        return { content, historyContent, isError: false };
+      } catch (error) {
+        return { content: error instanceof Error ? error.message : "Unable to query repository map", isError: true };
+      }
+    }
+  };
+}
 
 type ScanContent = {
   scannedPath: string;

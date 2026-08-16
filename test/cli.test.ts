@@ -5,7 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  AUTO_REPO_MAP_MAX_CHARACTERS,
   completeInteractiveOptions,
+  createRepositoryNavigation,
   createSystemCredentialStore,
   debugEnabled,
   loginWithCredentialStore,
@@ -15,6 +17,7 @@ import {
   parseArgs,
   readGlobalPreference,
   resolveApiKey,
+  runWithNavigation,
   runOneShot,
   selectAndSaveModel,
   saveGlobalPreference,
@@ -32,6 +35,37 @@ test("one-shot prompt uses the plain CLI transcript and prints its answer once",
   const text = output.join("");
   assert(!text.includes("YOU:") && !text.includes("MINI-PI") && !text.includes("activity"));
   assert.equal((text.match(/final answer/g) ?? []).length, 1);
+});
+
+test("repository navigation builds a query Tool and supplies transient context", async () => {
+  assert.equal(AUTO_REPO_MAP_MAX_CHARACTERS, 4_000);
+  const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-navigation-"));
+  await mkdir(join(rootDir, "src"));
+  await writeFile(join(rootDir, "src", "llm.ts"), "export interface ProviderConfig { model: string }");
+  const navigation = await createRepositoryNavigation(rootDir);
+  assert(navigation);
+  assert(navigation.tools.some((tool) => tool.name === "query_repo_map"));
+  assert(navigation.mapFor("provider configuration").text.length <= 4_000);
+  const calls: Array<{ prompt: string; options?: { transientContext?: string } }> = [];
+  const agent = { async run(prompt: string, options?: { transientContext?: string }) { calls.push({ prompt, options }); return { answer: "done", messages: [], turns: 1 }; } };
+  await runWithNavigation(agent, "provider configuration", navigation);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].options?.transientContext ?? "", /src\/llm\.ts/);
+  assert.match(calls[0].options?.transientContext ?? "", /source bodies not inspected/);
+});
+
+test("repository navigation degrades safely and TUI status never receives map text", async () => {
+  assert.equal(await createRepositoryNavigation("/does-not-exist"), undefined);
+  const calls: unknown[] = [];
+  const agent = { async run(...args: unknown[]) { calls.push(args); return { answer: "done", messages: [], turns: 1 }; } };
+  await runWithNavigation(agent, "question", undefined);
+  assert.deepEqual(calls, [["question"]]);
+  const output: string[] = [];
+  const view = new TuiView({ write: (text) => output.push(text) });
+  view.repositoryIndexStatus({ available: true, indexedFiles: 42, skippedFiles: 3, truncated: true });
+  const text = output.join("");
+  assert.match(text, /Repository index · 42 files · 3 skipped · truncated/);
+  assert(!text.includes("REPO MAP") && !text.includes("signature"));
 });
 
 function approvalRequest(permission: ApprovalRequest["permission"], argumentsValue: unknown = { path: "secret.txt" }): ApprovalRequest {
@@ -420,6 +454,19 @@ test("TuiView defers a failure until agent_end finalizes activity and startTui d
   const text = output.join("");
   assert(text.indexOf("▸ activity · 1 tools") < text.indexOf("Error: broken"));
   assert.equal((text.match(/Error: broken/g) ?? []).length, 1);
+});
+
+test("startTui delegates user prompts to the navigation-aware run callback", async () => {
+  const inputs = ["where is provider configuration?", "/exit"];
+  const prompts: string[] = [];
+  const agent = { reset() {}, async run() { throw new Error("direct run must not be used"); } } as never;
+  const code = await startTui(agent, { project: "/project", provider: "openai", model: "gpt" }, undefined, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: () => undefined,
+    runAgent: async (_agent, prompt) => { prompts.push(prompt); return { answer: "src/llm.ts", messages: [], turns: 1 }; }
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(prompts, ["where is provider configuration?"]);
 });
 
 test("TuiView forwards MINI_PI_DEBUG to diagnostic formatting", () => {

@@ -289,6 +289,52 @@ test("serializes null and undefined tool content safely", async () => {
   assert.deepEqual(fake.requests[1].filter((message) => message.role === "tool").map((message) => (message as { content: string }).content), ["", ""]);
 });
 
+test("Tool history breadcrumbs retain full content during a run then compact persistent history", async () => {
+  const full = "FULL_REPO_MAP_".repeat(1000);
+  const breadcrumb = "Repo map candidates: src/llm.ts; map truncated: no";
+  const fake = fakeLLM([response(null, [{ id: "map", name: "map", arguments: "{}" }]), response("done")]);
+  const agent = new Agent({ llm: fake.llm, tools: [tool("map", async () => ({ content: full, historyContent: breadcrumb, isError: false }))], systemPrompt: "rules", rootDir: "/p" });
+  const result = await agent.run("find provider");
+  assert.equal((fake.requests[1].at(-1) as { content: string }).content, full);
+  assert.equal((result.messages.find((message) => message.role === "tool") as { content: string }).content, breadcrumb);
+  assert.equal((agent.history().find((message) => message.role === "tool") as { content: string }).content, breadcrumb);
+});
+
+test("Tool history breadcrumbs cap Unicode safely and ignore malformed replacements", async () => {
+  for (const historyContent of ["😀".repeat(600), 12 as unknown as string]) {
+    const fake = fakeLLM([response(null, [{ id: "map", name: "map", arguments: "{}" }]), response("done")]);
+    const agent = new Agent({ llm: fake.llm, tools: [tool("map", async () => ({ content: "full", historyContent, isError: false }))], systemPrompt: "rules", rootDir: "/p" });
+    const result = await agent.run("x");
+    const retained = (result.messages.find((message) => message.role === "tool") as { content: string }).content;
+    if (typeof historyContent === "string") { assert.equal([...retained].length, 512); assert(!retained.endsWith("�")); }
+    else assert.equal(retained, "full");
+  }
+});
+
+test("transient context reaches every request but never persistent history", async () => {
+  const fake = fakeLLM([response(null, [{ id: "read", name: "noop", arguments: "{}" }]), response("done"), response("second")]);
+  const agent = new Agent({ llm: fake.llm, tools: [tool("noop", async () => ({ content: "ok", isError: false }))], systemPrompt: "rules", rootDir: "/project" });
+  const result = await agent.run("find provider", { transientContext: "REPO MAP\nsrc/llm.ts" });
+  for (const request of fake.requests.slice(0, 2)) assert.deepEqual(request.slice(0, 2), [
+    { role: "system", content: "rules" },
+    { role: "system", content: "Current-run repository navigation context:\nREPO MAP\nsrc/llm.ts" }
+  ]);
+  assert(!JSON.stringify(result.messages).includes("REPO MAP"));
+  assert(!JSON.stringify(agent.history()).includes("REPO MAP"));
+  await agent.run("second question", { transientContext: "SECOND MAP" });
+  assert(JSON.stringify(fake.requests[2]).includes("SECOND MAP"));
+  assert(!JSON.stringify(fake.requests[2]).includes("REPO MAP"));
+});
+
+test("transient context ignores whitespace and rejects content above its hard limit", async () => {
+  const fake = fakeLLM([response("plain")]);
+  const agent = new Agent({ llm: fake.llm, tools: [], systemPrompt: "rules", rootDir: "/project" });
+  await agent.run("plain", { transientContext: "  \n" });
+  assert.deepEqual(fake.requests[0], [{ role: "system", content: "rules" }, { role: "user", content: "plain" }]);
+  await assert.rejects(() => agent.run("too large", { transientContext: "x".repeat(8_001) }), /8,000/);
+  assert(!agent.history().some((message) => message.content === "too large"));
+});
+
 test("transports a safe provider diagnostic through the model error event", async () => {
   const failure = new ProviderDiagnostic({ provider: "deepseek", level: "warning", kind: "rate_limit", message: "DeepSeek 请求受限", reason: "当前请求被限流、余额或并发限制。", advice: "稍后重试，或切换模型 / Provider。", status: 429, code: "rate_limit", requestId: "req_2" });
   const fake = fakeLLM([failure]);

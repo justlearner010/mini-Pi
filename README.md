@@ -1,6 +1,6 @@
 # mini-Pi
 
-一个刻意保持很小的 TypeScript 终端 Agent。它只读地分析 TypeScript / JavaScript 项目：扫描目录、读取受限文本、检查静态 import 依赖。项目的目的不是做一个功能齐全的编码助手，而是在少于 1000 行核心源码中，学习 LLM Provider、Tool Calling、Agent loop、CLI 与 TUI 如何组成一个可运行闭环。
+一个刻意保持小而可读的 TypeScript 终端 Agent。它只读地分析 TypeScript / JavaScript 项目：扫描目录、读取受限文本、检查静态 import 依赖，并用语法级 Repo Index 快速定位与问题相关的候选文件。项目的目的不是做一个功能齐全的编码助手，而是通过可测试、可测量的增量，学习 LLM Provider、Tool Calling、Agent loop、上下文管理、CLI 与 TUI 如何组成一个可运行闭环。
 
 ## 架构
 
@@ -21,6 +21,7 @@
 - **v1.2：已完成。** TUI 会把最终回答的 Markdown 渲染为终端标题、列表、强调和代码样式；模型内容中的终端控制序列会被过滤，链接不会变成可点击的终端超链接。
 - **v1.3：已完成。** 交互式会话以低对比度的用户、回答、活动和错误层呈现；工具活动默认折叠，不输出原始事件日志。
 - **v2A：已完成。** 工具权限由 Agent runtime 强制执行：安全工具自动运行；需要确认的工具会在终端展示操作、原因、风险和参数，并等待用户决定。
+- **v2B / Issue #9：候选实现。** 启动时在本地构建一次有界、语法级 TS/JS Repo Index；每次提问只把按问题生成的紧凑 Repo Map 作为临时上下文发送给 Provider，并提供 `query_repo_map` 做一次按需细化。最终结论仍须读取源码验证。
 - **后续方向。** 项目级模型偏好、会话恢复、流式输出、OAuth、更多 Provider 等尚未实现，见 [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)。
 
 ## 安装
@@ -69,6 +70,10 @@ TUI 内可输入问题，或使用以下命令：
 
 Provider 或 Agent 错误使用红色区块显示安全诊断，并保留可展开的活动记录。
 
+启动 TUI 时会显示本地 Repository Index 的文件数、跳过数和是否截断。Index 只保存路径、import/export、选定声明签名和依赖关系，不分析函数 body；根目录 `.gitignore` 会被读取，嵌套 `.gitignore` 当前只计数并报告，不会解释。索引超出文件数、单文件或总字节限制时会截断并降级，而不是无限扫描。
+
+每个用户问题会获得一份不超过预算的 query-aware Repo Map。它只存在于本次 `Agent.run()` 的临时消息中，不写入对话历史、配置、凭据或终端活动详情。模型应先用它定位候选文件，再通过 `read_file` 验证源码；候选缺失、冲突或歧义时，可调用只查询内存索引的 `query_repo_map`。Index 构建失败时，mini-Pi 会回退到原有 `scan_project`、`read_file`、`analyze_dependencies` 流程。
+
 当 Agent 请求非安全工具时，终端会显示工具名、理由、风险与 JSON 参数。`SENSITIVE` 操作只能输入完全一致的 `y` 才会执行；`DESTRUCTIVE` 操作会显示 `HIGH RISK` 不可逆警告，且只能输入完全一致的 `yes` 才会执行。空输入、其他输入、EOF、Ctrl+C 或提示失败都会安全地拒绝；拒绝结果会作为一条工具观察返回给 Agent，让它调整后续回答。
 
 一次性模式必须明确指定 Provider 和模型：
@@ -108,3 +113,12 @@ npm run verify:package
 ```
 
 自动化测试使用假的凭据库和 Provider 客户端；仓库不会用真实 API Key 或真实系统凭据做测试。真实 OpenAI / DeepSeek 请求也没有在自动化测试中验证，因为它们需要你的凭据且可能产生费用。
+
+Repo Map 的本地确定性实验可运行：
+
+```sh
+npm run benchmark:repo-map
+npm run verify:repo-map
+```
+
+实验使用固定假模型轨迹，只验证候选定位、上下文边界和工具探索量；它不证明真实 Provider token、价格或端到端延迟已经下降。完整结果见 [Issue #9 实验报告](docs/experiments/9-query-aware-repo-map.md)。

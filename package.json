@@ -13,7 +13,10 @@
     "build": "tsc -p tsconfig.json",
     "benchmark:large": "npm run build && node scripts/benchmark-large-project.mjs",
     "benchmark:large:json": "node scripts/benchmark-large-project.mjs",
+    "benchmark:repo-map": "npm run build && node scripts/benchmark-query-repo-map.mjs",
+    "benchmark:repo-map:json": "node scripts/benchmark-query-repo-map.mjs",
     "verify:benchmark": "npm run build && node scripts/verify-benchmark.mjs",
+    "verify:repo-map": "npm run build && node scripts/verify-query-repo-map.mjs",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/**/*.test.ts",
     "verify:bin": "node scripts/verify-bin.mjs",
@@ -24,6 +27,7 @@
     "@github/keytar": "7.10.6",
     "@inquirer/password": "5.1.1",
     "@inquirer/select": "5.2.1",
+    "ignore": "7.0.6",
     "markdansi": "0.3.2",
     "openai": "7.4.0",
     "typescript": "5.9.3"
