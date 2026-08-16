@@ -21,8 +21,38 @@
 - **v1.2：已完成。** TUI 会把最终回答的 Markdown 渲染为终端标题、列表、强调和代码样式；模型内容中的终端控制序列会被过滤，链接不会变成可点击的终端超链接。
 - **v1.3：已完成。** 交互式会话以低对比度的用户、回答、活动和错误层呈现；工具活动默认折叠，不输出原始事件日志。
 - **v2A：已完成。** 工具权限由 Agent runtime 强制执行：安全工具自动运行；需要确认的工具会在终端展示操作、原因、风险和参数，并等待用户决定。
-- **v2B / Issue #9、#18：候选实现。** 启动时在本地构建一次有界、语法级 TS/JS Repo Index；每次提问只把按问题生成的紧凑 Repo Map 作为临时上下文发送给 Provider，并提供 `query_repo_map` 做一次按需细化。候选会标注 product/test/vendor 等范围、workspace package、排序理由和置信度；最终结论仍须读取源码验证。
+- **v2B / Issue #9、#18：已完成。** 启动时在本地构建一次有界、语法级 TS/JS Repo Index；每次提问只把按问题生成的紧凑 Repo Map 作为临时上下文发送给 Provider，并提供 `query_repo_map` 做一次按需细化。候选会标注 product/test/vendor 等范围、workspace package、排序理由和置信度；最终结论仍须读取源码验证。
 - **后续方向。** 项目级模型偏好、会话恢复、流式输出、OAuth、更多 Provider 等尚未实现，见 [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)。
+
+## 大型项目导航：当前阶段
+
+mini-Pi 现在具备的是**大型 TypeScript / JavaScript 项目的候选定位能力**：先以受限预算建立本地地图，再按用户问题缩小候选范围，最后由 Agent 读取源码获得证据。它不是完整的“自动读懂大型项目”系统，也不应把地图排名当作最终结论。
+
+### 已交付能力
+
+- **有界发现与索引：** 识别 TS/JS 源文件、导入导出、选定声明签名和静态依赖；遵守根 `.gitignore`，排除常见构建目录，并限制文件数、单文件大小和总字节数。
+- **紧凑 Repo Map：** 每轮仅注入与当前问题相关、最多 4,000 字符的临时地图；地图不会写入聊天历史、配置、凭据或 TUI 活动记录。
+- **范围感知排序：** 产品代码、测试、vendor、example/generated 范围、workspace package、角色词与角色文件形式共同排序；结果说明理由和 `high` / `ambiguous` / `fallback` 置信度。
+- **证据式探索：** Map 只用于定位。模型仍通过只读 `read_file`、`query_repo_map`、`analyze_dependencies` 等工具验证源码；索引异常会退回既有的扫描和读取流程。
+
+### 实验阶段与证据
+
+| 阶段 | 问题 | 已验证的结果 | 边界 |
+| --- | --- | --- | --- |
+| [#9 Repo Map](docs/experiments/9-query-aware-repo-map.md) | 索引能否让导航少走弯路？ | 本地固定轨迹中 Top-1 / Top-3 为 5/5；首次读取正确候选前的 Tool 调用中位数从 4 降至 1。 | 使用 fake LLM，不代表真实 token、费用或延迟。 |
+| [#16 / #17 外部评估](docs/experiments/10-deepseek-harness-repo-map-evaluation.md) | 简单词面排序在真实大型 monorepo 上够用吗？ | 不够用：产品范围 Top-1 0/5、Top-3 1/5，明确暴露了排序问题。 | 外部仓库只读；不调用 Provider。 |
+| [#18 / #19 范围排序](docs/experiments/18-scope-aware-repo-map-ranking.md) | scope/package/角色排序是否改善候选？ | 同一五题提升至产品范围 Top-1 3/5、Top-3 5/5。 | 仍是确定性轨迹，且 Map 可能截断。 |
+| [#20 / #21 真实 Provider](docs/experiments/20-live-provider-repo-map-evaluation.md) | 真实模型会怎样使用 Map？ | 一次 DeepSeek V4 Flash 运行中，五题均读取并提及正确路径；18 / 20 次请求，185,491 total tokens。 | 单一模型、单个 commit、一次顺序运行；未测 TTFT 或真实价格。 |
+
+### 如何理解这些结果
+
+真实闭环已经可用：Agent 不必遍历全部源码，就能先得到候选，再读取正确文件验证。与此同时，结果也指出了当前效率问题：五题中的 tools registry 一题消耗 107,210 tokens，说明模型仍可能重复查询、重复读取或做不必要的扫描。实验数据是进一步优化的起点，不是“已解决大型项目分析”的证明。
+
+### 边界与下一步
+
+- 当前不生成完整 call graph，不理解函数 body 语义，不追踪运行时动态关系，也不支持所有编程语言。
+- 4,000 字符是默认成本/覆盖折中；遇到歧义时可用 `query_repo_map` 进一步缩小范围，而不是盲目扩大所有上下文。
+- 下一步是 [Issue #10](https://github.com/justlearner010/mini-Pi/issues/10)：加入工具编排与证据护栏，明确何时细化地图、何时读源码、何时检查依赖，并以同一题集继续比较真实请求数、token 与端到端延迟。
 
 ## 安装
 
@@ -121,6 +151,4 @@ npm run benchmark:repo-map
 npm run verify:repo-map
 ```
 
-实验使用固定假模型轨迹，只验证候选定位、上下文边界和工具探索量；它不证明真实 Provider token、价格或端到端延迟已经下降。完整结果见 [Issue #9 实验报告](docs/experiments/9-query-aware-repo-map.md)。
-
-在外部大型 monorepo `deepseek-harness` 上，Issue #16 先确认简单词面 Ranking 不足；Issue #18 随后以同一五题验证了 scope/package/角色排序的改进（产品范围 Top-1 `3/5`、Top-3 `5/5`）。两份证据与限制分别见 [基线评估](docs/experiments/10-deepseek-harness-repo-map-evaluation.md) 和 [Issue #18 报告](docs/experiments/18-scope-aware-repo-map-ranking.md)。两项实验都不调用真实 Provider。
+这组命令只运行本地、确定性的 fake-LLM 实验。真实 Provider 评估需要显式 `DEEPSEEK_API_KEY`，会发送模型选择读取的项目内容并可能产生费用，因此不属于 `npm test`；请先阅读 [#20 的真实运行边界与结果](docs/experiments/20-live-provider-repo-map-evaluation.md)。

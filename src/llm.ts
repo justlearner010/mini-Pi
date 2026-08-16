@@ -25,6 +25,24 @@ export interface ToolResultMessage { role: "tool"; toolCallId: string; content: 
 export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 export interface ModelResponse { message: AssistantMessage; }
 export interface LLMClient { generate(messages: Message[], tools: Tool[]): Promise<ModelResponse>; }
+export interface ProviderUsage { promptTokens?: number; completionTokens?: number; totalTokens?: number; }
+export interface LLMTelemetryEvent {
+  provider: ProviderName;
+  model: string;
+  outcome: "success" | "failure";
+  durationMs: number;
+  usage?: ProviderUsage;
+}
+export type LLMTelemetry = (event: LLMTelemetryEvent) => void;
+export class LiveEvaluationBudgetExceeded extends Error { constructor() { super("Live evaluation request budget exhausted"); this.name = "LiveEvaluationBudgetExceeded"; } }
+export function withRequestBudget(llm: LLMClient, maxRequests: number): { llm: LLMClient; requestsStarted: () => number } {
+  if (!Number.isSafeInteger(maxRequests) || maxRequests < 1) throw new Error("Live evaluation request budget must be positive");
+  let started = 0;
+  return {
+    llm: { async generate(messages, tools) { if (started === maxRequests) throw new LiveEvaluationBudgetExceeded(); started += 1; return llm.generate(messages, tools); } },
+    requestsStarted: () => started
+  };
+}
 
 export interface ProviderClient {
   chat: { completions: { create(request: unknown): Promise<unknown> } };
@@ -63,6 +81,14 @@ function safeError(prefix: string): Error {
   return new Error(prefix);
 }
 
+function usageOf(raw: unknown): ProviderUsage | undefined {
+  const usage = (raw as { usage?: unknown })?.usage as { prompt_tokens?: unknown; completion_tokens?: unknown; total_tokens?: unknown } | undefined;
+  const number = (value: unknown): number | undefined => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  const result = { ...(number(usage?.prompt_tokens) === undefined ? {} : { promptTokens: number(usage?.prompt_tokens) }), ...(number(usage?.completion_tokens) === undefined ? {} : { completionTokens: number(usage?.completion_tokens) }), ...(number(usage?.total_tokens) === undefined ? {} : { totalTokens: number(usage?.total_tokens) }) };
+  return Object.keys(result).length ? result : undefined;
+}
+function emitTelemetry(telemetry: LLMTelemetry | undefined, event: LLMTelemetryEvent): void { try { telemetry?.(event); } catch { /* telemetry must not affect requests */ } }
+
 function codeOf(value: unknown): string | undefined { return typeof value === "string" && ["invalid_api_key", "rate_limit_exceeded", "model_not_found"].includes(value) ? value : undefined; }
 function diagnostic(provider: ProviderName, error: unknown): ProviderDiagnostic {
   const raw = error as { status?: unknown; code?: unknown; request_id?: unknown; requestId?: unknown; message?: unknown };
@@ -74,7 +100,7 @@ function diagnostic(provider: ProviderName, error: unknown): ProviderDiagnostic 
   return new ProviderDiagnostic({ provider, level, kind, message, reason, advice, ...(status === undefined ? {} : { status }), ...(code ? { code } : {}), ...(requestId ? { requestId } : {}) });
 }
 
-export function createLLM(config: LLMConfig, client: ProviderClient = clientFor(config.provider, config.apiKey)): LLMClient {
+export function createLLM(config: LLMConfig, client: ProviderClient = clientFor(config.provider, config.apiKey), telemetry?: LLMTelemetry): LLMClient {
   return {
     async generate(messages, tools) {
       const request: Record<string, unknown> = {
@@ -83,10 +109,16 @@ export function createLLM(config: LLMConfig, client: ProviderClient = clientFor(
         tools: tools.map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))
       };
       if (config.provider === "deepseek") request.extra_body = { thinking: { type: "disabled" } };
+      const started = process.hrtime.bigint();
       try {
-        const response = modelResponse(await client.chat.completions.create(request));
+        const raw = await client.chat.completions.create(request);
+        const durationMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+        const response = modelResponse(raw);
+        emitTelemetry(telemetry, { provider: config.provider, model: config.model, outcome: "success", durationMs, ...(usageOf(raw) ? { usage: usageOf(raw) } : {}) });
         return response;
       } catch (error) {
+        const durationMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+        emitTelemetry(telemetry, { provider: config.provider, model: config.model, outcome: "failure", durationMs });
         throw diagnostic(config.provider, error);
       }
     }
