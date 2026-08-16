@@ -279,9 +279,13 @@ test("Repo Map renders confidence and scoped candidates within fixed budgets", a
   const high = queryRepositoryIndex(index, "DeepSeek adapter", { maxCharacters: 4_000, limit: 8 });
   assert.equal(high.confidence, "high");
   assert.match(high.text, /src\/adapter\.ts  \[product · package @repo\/root\]/);
-  assert.match(high.text, /reason: exact symbol match; scope: product; role: adapter/);
+  assert.match(high.text, /reason: scope: product; role: adapter; role file form/);
   assert(high.text.length <= 4_000);
-  const ambiguous = queryRepositoryIndex(index, "adapter", { maxCharacters: 8_000, limit: 8 });
+  const tied = await buildRepositoryIndex(await project({
+    "src/one.ts": "export const adapter = true",
+    "src/two.ts": "export const adapter = true"
+  }));
+  const ambiguous = queryRepositoryIndex(tied, "adapter", { maxCharacters: 8_000, limit: 8 });
   assert.equal(ambiguous.confidence, "ambiguous");
   const fallback = queryRepositoryIndex(index, "unmatched mystery", { maxCharacters: 8_000, limit: 8 });
   assert.equal(fallback.confidence, "fallback");

@@ -297,7 +297,7 @@ export async function buildRepositoryIndex(rootDir: string, limits: RepositoryIn
   return { files, incoming, outgoing, entryCandidates, inspectedFileCount: files.length, inspectedBytes: discovery.inspectedBytes, skipped: Object.freeze({ ...discovery.skipped, nestedGitignore: discovery.nestedGitignoreFiles, unsupportedLanguage: discovery.unsupportedLanguageFiles }), truncated: discovery.truncated };
 }
 
-export type QueryRole = "cli" | "adapter" | "loop" | "registry" | "config";
+export type QueryRole = "cli" | "adapter" | "loop" | "registry" | "config" | "compaction";
 export interface QueryIntent {
   tokens: readonly string[];
   requestedAreas: readonly FileArea[];
@@ -324,7 +324,8 @@ const ROLE_LEXICON: Readonly<Record<QueryRole, { query: readonly string[]; match
   adapter: { query: ["adapter", "provider", "llm", "model"], match: ["adapter", "provider", "llm", "client"] },
   loop: { query: ["loop", "agent", "run", "turn"], match: ["agent", "loop", "run", "turn"] },
   registry: { query: ["tool", "tools", "registry", "execute"], match: ["tool", "registry", "execute"] },
-  config: { query: ["config", "configuration", "settings", "env"], match: ["config", "settings", "env", "option"] }
+  config: { query: ["config", "configuration", "settings", "env"], match: ["config", "settings", "env", "option"] },
+  compaction: { query: ["compaction", "compact", "context"], match: ["compaction", "compact", "context"] }
 };
 const AREA_TERMS: Readonly<Record<FileArea, readonly string[]>> = {
   product: [], test: ["test", "spec", "fixture"], vendor: ["vendor", "third", "party"],
@@ -342,6 +343,14 @@ export function deriveQueryIntent(query: string): QueryIntent {
 type CandidateScore = readonly [number, number, number, number, number, number, number, number];
 function compareScore(left: CandidateScore, right: CandidateScore): number {
   for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return right[index] - left[index];
+  return 0;
+}
+
+function roleFileForm(path: string, roles: readonly QueryRole[]): number {
+  const base = basename(path).replace(/\.d\.ts$|\.[^.]+$/i, "").toLowerCase();
+  if (roles.includes("cli") && base === "bin") return 1;
+  if (roles.includes("adapter") && base === "adapter") return 1;
+  if (roles.includes("compaction") && base === "index") return 1;
   return 0;
 }
 
@@ -365,13 +374,13 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
     const area = intent.requestedAreas.includes(file.area) || (intent.implementationSeeking && file.area === "product");
     const role = intent.roles.filter((item) => ROLE_LEXICON[item].match.some((term) => pathTokens.has(term) || symbolTokens.has(term))).length;
     const packageMatches = overlap(queryTokens, packageTokens);
-    const entry = Number(intent.roles.includes("cli") && index.entryCandidates.includes(file.path));
-    return { file, score: [Number(exact), Number(area), role, packageMatches, symbolMatches, pathMatches, entry, index.incoming.get(file.path)?.length ?? 0] as CandidateScore };
+    const form = roleFileForm(file.path, intent.roles);
+    return { file, score: [Number(area), role, packageMatches, form, Number(exact), symbolMatches, pathMatches, index.incoming.get(file.path)?.length ?? 0] as CandidateScore };
   });
   ranked.sort((left, right) => {
     return compareScore(left.score, right.score) || left.file.path.localeCompare(right.file.path);
   });
-  const seeds = ranked.filter((item) => item.score[0] || item.score[2] || item.score[3] || item.score[4] || item.score[5]);
+  const seeds = ranked.filter((item) => item.score[1] || item.score[2] || item.score[4] || item.score[5] || item.score[6]);
   const selected: Array<{ file: FileInfo; reasons: string[] }> = [];
   if (!seeds.length) {
     for (const path of index.entryCandidates) {
@@ -384,13 +393,13 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
         return tokens(item.file.path).includes(term) || item.file.symbols.some((symbol) => tokens(symbol.name).includes(term));
       })) ?? "match";
       const reasons = [
-        item.score[0] ? "exact symbol match" : "",
-        item.score[1] ? `scope: ${item.file.area}` : "",
-        item.score[2] ? `role: ${roleReason}` : "",
-        item.score[3] ? `package: ${item.file.packageName ?? item.file.packageRoot}` : "",
-        item.score[4] ? "symbol match" : "",
-        item.score[5] ? "path match" : "",
-        item.score[6] ? "entry candidate" : "",
+        item.score[0] ? `scope: ${item.file.area}` : "",
+        item.score[1] ? `role: ${roleReason}` : "",
+        item.score[2] ? `package: ${item.file.packageName ?? item.file.packageRoot}` : "",
+        item.score[3] ? "role file form" : "",
+        item.score[4] ? "exact symbol match" : "",
+        item.score[5] ? "symbol match" : "",
+        item.score[6] ? "path match" : "",
         item.score[7] ? "dependency" : ""
       ].filter(Boolean).slice(0, 3);
       selected.push({ file: item.file, reasons });
@@ -405,7 +414,7 @@ export function queryRepositoryIndex(index: RepositoryIndex, query: string, opti
   }
   const confidence = !seeds.length ? "fallback" : (() => {
     const top = seeds[0]!.score, next = seeds[1]?.score;
-    const broadOnly = !top[0] && !top[1] && !top[2];
+    const broadOnly = !top[0] && !top[1] && !top[2] && !top[3] && !top[4];
     return broadOnly || (next !== undefined && compareScore(top, next) === 0) ? "ambiguous" : "high";
   })();
   const eligibleCount = selected.length;
