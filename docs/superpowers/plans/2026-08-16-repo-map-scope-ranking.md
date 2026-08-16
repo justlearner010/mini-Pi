@@ -156,7 +156,11 @@ export function deriveQueryIntent(query: string): QueryIntent;
 
 Use one readonly lexicon: CLI=`cli command terminal shell`,
 adapter=`adapter provider llm model`, loop=`loop agent run turn`,
-registry=`tool tools registry execute`, config=`config configuration settings env`.
+registry=`tool tools registry execute`, config=`config configuration settings env`,
+compaction=`compaction compact context`. Add a path-only file-form classifier
+for `implementation`, `barrel` (`index.*`), `types`, `config`, `adapter`, and
+`bin`; test that `adapter` questions prefer `adapter.ts`, CLI questions prefer
+`bin.ts`, and compaction questions may prefer a matching package `index.ts`.
 Explicit areas are test/spec/fixture, vendor/third-party, example/demo, and
 generated/codegen. `implementationSeeking` requires a role and no requested
 non-product area.
@@ -167,16 +171,18 @@ Refactor `queryRepositoryIndex` to order direct candidates by:
 
 ```ts
 type CandidateScore = readonly [
-  exactSymbol: number, area: number, role: number, packageMatch: number,
-  symbolMatches: number, pathMatches: number, entry: number, incoming: number
+  area: number, role: number, packageMatch: number, roleFileForm: number,
+  exactSymbol: number, symbolMatches: number, pathMatches: number, incoming: number
 ];
 ```
 
 Area boosts explicit requested scope, or product only for implementation
 questions. Role counts approved role words in basename/path/exported symbols.
-Package counts query overlap with package name/root. Entry boosts only a CLI
-role plus existing entry evidence. Sort lexical project path after the tuple.
-Never filter any area. Keep one-hop expansion after ranked direct seeds.
+Package counts query overlap with package name/root. `roleFileForm` boosts
+`bin.*` for CLI, `adapter.*` for adapter, and `index.*` only for compaction.
+Exact symbols are deliberately after role/package/file-form so generic exports
+cannot hijack a focused implementation query. Sort lexical project path after
+the tuple. Never filter any area. Keep one-hop expansion after ranked direct seeds.
 Create reasons in this order, capped at three: exact symbol; scope; role;
 package; symbol/path; entry; dependency.
 
@@ -301,4 +307,3 @@ clear recommendation.
 - [ ] Run Task 4's complete verification matrix from a clean worktree.
 - [ ] Link #9, #16, and #18 in the PR; state #10 remains tool orchestration.
 - [ ] Include pass/fail threshold results and wait for repository-owner review before merging.
-

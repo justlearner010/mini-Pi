@@ -73,6 +73,7 @@ for (const scope of scopes) for (const variant of ["none", "map-4000", "map-8000
   const maxCharacters = variant === "map-4000" ? 4_000 : 8_000;
   const rendered = process.hrtime.bigint();
   const map = variant === "none" ? undefined : queryRepositoryIndex(scope.index, question.prompt, { maxCharacters, limit: 8 });
+  const rankedCandidates = map?.candidates.slice(0, 3) ?? [];
   const mapRenderMs = variant === "none" ? 0 : Number(process.hrtime.bigint() - rendered) / 1_000_000;
   const topPath = map?.candidates[0]?.path;
   const metrics = { modelRequests: 0, toolCalls: 0, toolCallsByName: {}, filesRead: 0, returnedToolBytes: 0, sourceBytesBeforeCorrectRead: 0, requestCharacters: 0, firstCorrectCandidateRead: null };
@@ -81,8 +82,8 @@ for (const scope of scopes) for (const variant of ["none", "map-4000", "map-8000
   let outcome = "answered", turns = 0;
   try { turns = (await agent.run(question.prompt, map ? { transientContext: map.text } : undefined)).turns; }
   catch (error) { outcome = error instanceof Error && /maximum turns/i.test(error.message) ? "maximum_turns" : "failed"; turns = metrics.modelRequests; }
-  runs.push({ scope: scope.id, variant, questionId: question.id, outcome, topCandidates: map?.candidates.slice(0, 3).map((candidate) => candidate.path) ?? [], top1: map ? question.expectedPaths.includes(topPath) : false, top3: map ? map.candidates.slice(0, 3).some((candidate) => question.expectedPaths.includes(candidate.path)) : false, indexBuildMs, mapRenderMs, indexFiles: scope.index.inspectedFileCount, indexBytes: scope.index.inspectedBytes, indexTruncated: scope.index.truncated, mapTruncated: map?.mapTruncated ?? false, turns, ...metrics, toolCallsByName: Object.fromEntries(Object.entries(metrics.toolCallsByName).sort(([left], [right]) => left.localeCompare(right))) });
+  runs.push({ scope: scope.id, variant, questionId: question.id, outcome, topCandidates: rankedCandidates.map((candidate) => candidate.path), candidateReasons: rankedCandidates.map((candidate) => candidate.reasons), candidateAreas: rankedCandidates.map((candidate) => candidate.area), candidatePackages: rankedCandidates.map((candidate) => candidate.packageName ?? candidate.packageRoot), confidence: map?.confidence ?? "none", top1: map ? question.expectedPaths.includes(topPath) : false, top3: map ? rankedCandidates.some((candidate) => question.expectedPaths.includes(candidate.path)) : false, indexBuildMs, mapRenderMs, indexFiles: scope.index.inspectedFileCount, indexBytes: scope.index.inspectedBytes, indexTruncated: scope.index.truncated, mapTruncated: map?.mapTruncated ?? false, turns, ...metrics, toolCallsByName: Object.fromEntries(Object.entries(metrics.toolCallsByName).sort(([left], [right]) => left.localeCompare(right))) });
 }
 
 runs.sort((left, right) => left.scope.localeCompare(right.scope) || left.variant.localeCompare(right.variant) || left.questionId.localeCompare(right.questionId));
-process.stdout.write(`${JSON.stringify({ schemaVersion: 1, target: { repository: "deepseek-harness", commit: targetCommit }, questions, scopes: scopes.map(({ id, index }) => ({ id, indexedFiles: index.inspectedFileCount, indexedBytes: index.inspectedBytes, truncated: index.truncated, skipped: index.skipped })), runs })}\n`);
+process.stdout.write(`${JSON.stringify({ schemaVersion: 2, target: { repository: "deepseek-harness", commit: targetCommit }, questions, scopes: scopes.map(({ id, index }) => ({ id, indexedFiles: index.inspectedFileCount, indexedBytes: index.inspectedBytes, truncated: index.truncated, skipped: index.skipped })), runs })}\n`);

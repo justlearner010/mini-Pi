@@ -159,18 +159,21 @@ component wins and project-relative path remains the final stable tie-breaker.
 The exact numeric constants may be implemented as named constants, but their
 priority order must remain:
 
-1. exact symbol/export identifier match;
-2. explicit requested-area match, or product-area preference for an
+1. explicit requested-area match, or product-area preference for an
    implementation-seeking question;
-3. role match in basename/path or exported symbol;
-4. package-name/package-path token match;
-5. existing symbol/export token-match count;
-6. existing basename/path token-match count;
-7. query-relevant entry evidence (only when an entry-like role is requested);
+2. role match in basename/path or exported symbol, including an explicit
+   role-specific implementation filename such as `adapter.ts` or `bin.ts`;
+3. package-name/package-path token match;
+4. role-specific file form: `bin` for CLI and `index` for compaction;
+5. exact symbol/export identifier match;
+6. existing symbol/export query-token matches;
+7. existing basename/path query-token matches;
 8. existing local incoming-dependency count;
 9. lexical project-relative path.
 
-Area preference is a boost, not a filter. For example, a query explicitly
+Area preference is a boost, not a filter. A bare exact match of a generic
+identifier such as `Tool` or `Adapter` is therefore not allowed to outrank a
+role- and package-specific implementation candidate. For example, a query explicitly
 asking for tests makes test files eligible for the corresponding preference;
 an exact symbol match in a test still remains visible even for an ordinary
 implementation question. Neighbor expansion remains one local dependency hop
@@ -180,6 +183,23 @@ Each rendered candidate includes at most three short reasons selected from
 `exact symbol`, `scope`, `role`, `package`, `path`, `entry`, and `dependency`.
 This lets the Agent and user distinguish a high-confidence implementation
 candidate from a merely lexical fallback.
+
+### Experiment-driven role refinement
+
+Issue #16 showed that the initial five roles were insufficient for the fixed
+large-monorepo questions. Issue #18 therefore adds one role and two explicit
+file-form preferences:
+
+| Role/form | Query evidence | Preferred file form | Reason |
+| --- | --- | --- | --- |
+| `compaction` | compaction, compact, context | `index.ts` in a matching compaction package | separates the implementation entry from adjacent types/configuration |
+| CLI entry | existing `cli` role | `bin.ts` | recognises a command-line process entry even though it is not named `cli.ts` |
+| adapter implementation | existing `adapter` role | `adapter.ts` | prevents generic LLM barrel exports from hiding an adapter module |
+
+The implementation additionally classifies filenames as `implementation`,
+`barrel`, `types`, or `config` for explanation only. It must not permanently
+penalize an `index.ts`: the role-specific compaction preference deliberately
+allows an index file to be the correct implementation entry.
 
 ## Ambiguity and evidence guardrails
 

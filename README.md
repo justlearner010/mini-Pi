@@ -21,7 +21,7 @@
 - **v1.2：已完成。** TUI 会把最终回答的 Markdown 渲染为终端标题、列表、强调和代码样式；模型内容中的终端控制序列会被过滤，链接不会变成可点击的终端超链接。
 - **v1.3：已完成。** 交互式会话以低对比度的用户、回答、活动和错误层呈现；工具活动默认折叠，不输出原始事件日志。
 - **v2A：已完成。** 工具权限由 Agent runtime 强制执行：安全工具自动运行；需要确认的工具会在终端展示操作、原因、风险和参数，并等待用户决定。
-- **v2B / Issue #9：候选实现。** 启动时在本地构建一次有界、语法级 TS/JS Repo Index；每次提问只把按问题生成的紧凑 Repo Map 作为临时上下文发送给 Provider，并提供 `query_repo_map` 做一次按需细化。最终结论仍须读取源码验证。
+- **v2B / Issue #9、#18：候选实现。** 启动时在本地构建一次有界、语法级 TS/JS Repo Index；每次提问只把按问题生成的紧凑 Repo Map 作为临时上下文发送给 Provider，并提供 `query_repo_map` 做一次按需细化。候选会标注 product/test/vendor 等范围、workspace package、排序理由和置信度；最终结论仍须读取源码验证。
 - **后续方向。** 项目级模型偏好、会话恢复、流式输出、OAuth、更多 Provider 等尚未实现，见 [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)。
 
 ## 安装
@@ -123,4 +123,4 @@ npm run verify:repo-map
 
 实验使用固定假模型轨迹，只验证候选定位、上下文边界和工具探索量；它不证明真实 Provider token、价格或端到端延迟已经下降。完整结果见 [Issue #9 实验报告](docs/experiments/9-query-aware-repo-map.md)。
 
-在外部大型 monorepo `deepseek-harness` 上的双轨评估显示，当前简单词面 Ranking 尚不能可靠定位五个核心实现；该负面结果与 scope / Ranking 改进建议见 [外部评估报告](docs/experiments/10-deepseek-harness-repo-map-evaluation.md)。
+在外部大型 monorepo `deepseek-harness` 上，Issue #16 先确认简单词面 Ranking 不足；Issue #18 随后以同一五题验证了 scope/package/角色排序的改进（产品范围 Top-1 `3/5`、Top-3 `5/5`）。两份证据与限制分别见 [基线评估](docs/experiments/10-deepseek-harness-repo-map-evaluation.md) 和 [Issue #18 报告](docs/experiments/18-scope-aware-repo-map-ranking.md)。两项实验都不调用真实 Provider。
