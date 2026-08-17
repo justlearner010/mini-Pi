@@ -20,7 +20,7 @@ export class ProviderDiagnostic extends Error {
 export interface SystemMessage { role: "system"; content: string; }
 export interface UserMessage { role: "user"; content: string; }
 export interface ToolCall { id: string; name: string; arguments: string; }
-export interface AssistantMessage { role: "assistant"; content: string | null; toolCalls: ToolCall[]; }
+export interface AssistantMessage { role: "assistant"; content: string | null; toolCalls: ToolCall[]; /** DeepSeek returns this whenever thinking produced it; passing it back on the next request is required. */ reasoningContent?: string; }
 export interface ToolResultMessage { role: "tool"; toolCallId: string; content: string; }
 export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 export interface ModelResponse { message: AssistantMessage; }
@@ -57,24 +57,29 @@ function clientFor(provider: ProviderName, apiKey: string): ProviderClient {
 
 function requestMessages(messages: Message[]): ProviderMessage[] {
   return messages.map((message) => {
-    if (message.role === "assistant") return {
-      role: "assistant", content: message.content,
-      tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }))
-    };
+    if (message.role === "assistant") {
+      const result: ProviderMessage = {
+        role: "assistant", content: message.content,
+        tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }))
+      };
+      if (typeof message.reasoningContent === "string") result.reasoning_content = message.reasoningContent;
+      return result;
+    }
     if (message.role === "tool") return { role: "tool", tool_call_id: message.toolCallId, content: message.content };
     return { role: message.role, content: message.content };
   });
 }
 
 function modelResponse(raw: unknown): ModelResponse {
-  const choice = (raw as { choices?: unknown[] })?.choices?.[0] as { message?: { content?: unknown; tool_calls?: unknown[] } } | undefined;
+  const choice = (raw as { choices?: unknown[] })?.choices?.[0] as { message?: { content?: unknown; tool_calls?: unknown[]; reasoning_content?: unknown } } | undefined;
   if (!choice?.message) throw new Error("Provider returned no choices");
   const toolCalls = (choice.message.tool_calls ?? []).flatMap((call) => {
     const item = call as { id?: unknown; function?: { name?: unknown; arguments?: unknown } };
     return typeof item.id === "string" && typeof item.function?.name === "string" && typeof item.function.arguments === "string"
       ? [{ id: item.id, name: item.function.name, arguments: item.function.arguments }] : [];
   });
-  return { message: { role: "assistant", content: typeof choice.message.content === "string" ? choice.message.content : null, toolCalls } };
+  const reasoningContent = typeof choice.message.reasoning_content === "string" && choice.message.reasoning_content.length > 0 ? choice.message.reasoning_content : undefined;
+  return { message: { role: "assistant", content: typeof choice.message.content === "string" ? choice.message.content : null, toolCalls, ...(reasoningContent ? { reasoningContent } : {}) } };
 }
 
 function safeError(prefix: string): Error {

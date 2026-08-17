@@ -5,7 +5,6 @@
 ## LLM 输出
 
 - Token streaming：当前回答仍在一次 Agent 运行完成后才展示，不逐字输出模型内容。
-- Thinking / reasoning 模式，包括保存并回传 DeepSeek 的 `reasoning_content`。
 - OpenAI Responses API；当前统一使用 OpenAI-compatible Chat Completions API。
 - 自动重试、模型回退和 Token 用量统计。
 - 自定义 Provider `baseURL`。
