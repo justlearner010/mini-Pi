@@ -22,7 +22,9 @@
 - **v1.3：已完成。** 交互式会话以低对比度的用户、回答、活动和错误层呈现；工具活动默认折叠，不输出原始事件日志。
 - **v2A：已完成。** 工具权限由 Agent runtime 强制执行：安全工具自动运行；需要确认的工具会在终端展示操作、原因、风险和参数，并等待用户决定。
 - **v2B / Issue #9、#18：已完成。** 启动时在本地构建一次有界、语法级 TS/JS Repo Index；每次提问只把按问题生成的紧凑 Repo Map 作为临时上下文发送给 Provider，并提供 `query_repo_map` 做一次按需细化。候选会标注 product/test/vendor 等范围、workspace package、排序理由和置信度；最终结论仍须读取源码验证。
-- **后续方向。** 项目级模型偏好、会话恢复、流式输出、OAuth、更多 Provider 等尚未实现，见 [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)。
+- **v2C / Issue #22–#25（0.2.0）：已完成。** 会话内任意时刻切换项目：`/project <目录>` 手动切换（重新校验目录、重建 Repository Index、清空当前对话），Agent 也可在用户问题涉及当前根目录之外的项目时自行调用 `switch_project` 工具（SENSITIVE，终端展示目标路径，用户输入 `y` 确认），并修复了多次切换后 `switch_project` 工具被丢失的回归。同时为 DeepSeek / OpenAI 的 402（余额不足）、400 / 422（请求无效）新增专属诊断分类，TUI 提示更加可执行。
+- **v2D / Issue #26（在审）：** 捕获并回传 DeepSeek 的 `reasoning_content`，避免多轮对话因 thinking 历史丢失而出现 HTTP 400。该修复使真实 Provider 多轮运行不再受累。
+- **后续方向。** 项目级模型偏好、会话恢复、流式输出、OAuth、更多 Provider 等尚未实现，见 [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)。**当前不存在的**会话内对话管理（消息累积修剪 / 摘要）已被识别为近期需要解决的问题；尚未排进版本。
 
 ## 大型项目导航：当前阶段
 
@@ -52,7 +54,7 @@ mini-Pi 现在具备的是**大型 TypeScript / JavaScript 项目的候选定位
 
 - 当前不生成完整 call graph，不理解函数 body 语义，不追踪运行时动态关系，也不支持所有编程语言。
 - 4,000 字符是默认成本/覆盖折中；遇到歧义时可用 `query_repo_map` 进一步缩小范围，而不是盲目扩大所有上下文。
-- 下一步是 [Issue #10](https://github.com/justlearner010/mini-Pi/issues/10)：加入工具编排与证据护栏，明确何时细化地图、何时读源码、何时检查依赖，并以同一题集继续比较真实请求数、token 与端到端延迟。
+- 下一步首先是 [Issue #10](https://github.com/justlearner010/mini-Pi/issues/10)：实现已写好的工具编排与证据护栏 spec（确定性规则拦截重复、超预算、明显无关读取与证据充足后扩张），并在同一题集上比较真实请求数、token 与端到端延迟。其次是会话内对话管理——Agent 消息历史在 TUI 内只增不减，长会话会先触发 Provider 协议校验（如已发生的 `reasoning_content` 400），最终撞到 context 上限；需要在 Agent 层引入滑动窗口或摘要压缩。这两件都没有排进具体版本。
 
 ## 安装
 
@@ -119,7 +121,7 @@ OPENAI_API_KEY="..." npm run dev -- ../my-project \
 
 ## 请求错误诊断
 
-模型请求失败时，mini-Pi 会显示中文的错误级别、Provider、回合、原因与建议。例如认证失败会提示运行 `/login` 更新 Key，限流会建议稍后重试或切换模型。若需要排查技术细节，可在启动时开启安全调试信息：
+模型请求失败时，mini-Pi 会显示中文的错误级别、Provider、回合、原因与建议。例如认证失败会提示运行 `/login` 更新 Key，限流会建议稍后重试或切换模型，余额不足（HTTP 402）会提示充值或切换 Provider，请求无效（HTTP 400/422，如协议层校验失败）会建议 `/model` 切换模型重试。若需要排查技术细节，可在启动时开启安全调试信息：
 
 ```sh
 MINI_PI_DEBUG=1 npm run dev -- ../my-project
