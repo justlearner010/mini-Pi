@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   AUTO_REPO_MAP_MAX_CHARACTERS,
   completeInteractiveOptions,
+  composeAgentTools,
   createRepositoryNavigation,
   createSystemCredentialStore,
   debugEnabled,
@@ -27,7 +28,8 @@ import {
   validateOptions
 } from "../src/cli.js";
 import { formatEvent, helpText, parseCommand, renderMarkdown, requestTerminalApproval, startTui, TuiView, type TuiRuntime } from "../src/tui.js";
-import type { ApprovalRequest } from "../src/agent.js";
+import { Agent, type ApprovalRequest } from "../src/agent.js";
+import { switchProjectTool, tools, type Tool } from "../src/tool.js";
 
 test("one-shot prompt uses the plain CLI transcript and prints its answer once", async () => {
   const output: string[] = [];
@@ -441,6 +443,65 @@ test("resolveProjectRoot canonicalizes directories and rejects missing or non-di
   await assert.rejects(resolveProjectRoot(process.cwd(), join(rootDir, "missing")), /Project directory/);
   await writeFile(join(rootDir, "file.ts"), "export const x = 1;");
   await assert.rejects(resolveProjectRoot(process.cwd(), join(rootDir, "file.ts")), /Project directory/);
+});
+
+test("composeAgentTools always keeps switch_project available without duplicating it", () => {
+  assert.equal(composeAgentTools(undefined).filter((tool) => tool.name === "switch_project").length, 1);
+  const withBase = composeAgentTools(tools);
+  assert.equal(withBase.filter((tool) => tool.name === "switch_project").length, 1);
+  const already = composeAgentTools([...tools, switchProjectTool]);
+  assert.equal(already.filter((tool) => tool.name === "switch_project").length, 1);
+});
+
+test("an agent can switch projects repeatedly in one session", async () => {
+  const projectA = await realpath(await mkdtemp(join(tmpdir(), "mini-pi-switch-a-")));
+  const projectB = await realpath(await mkdtemp(join(tmpdir(), "mini-pi-switch-b-")));
+  await mkdir(join(projectA, "src"));
+  await mkdir(join(projectB, "src"));
+  await writeFile(join(projectA, "src", "a.ts"), "export const a = 1;");
+  await writeFile(join(projectB, "src", "b.ts"), "export const b = 2;");
+
+  const handler = async (path: string) => {
+    const rootDir = await resolveProjectRoot(process.cwd(), path);
+    const navigation = await createRepositoryNavigation(rootDir);
+    return { ok: true, rootDir, tools: composeAgentTools(navigation?.tools) };
+  };
+  const steps = [
+    { id: "s1", path: projectA },
+    { id: "s2", path: projectB }
+  ];
+  const toolSets: string[][] = [];
+  const llm = {
+    async generate(_messages: unknown, availableTools: Tool[]) {
+      toolSets.push(availableTools.map((tool) => tool.name));
+      const call = toolSets.length;
+      if (call <= 2) {
+        const step = steps[call - 1];
+        return { message: { role: "assistant", content: null, toolCalls: [{ id: step.id, name: "switch_project", arguments: JSON.stringify({ path: step.path }) }] } };
+      }
+      if (call === 3) return { message: { role: "assistant", content: null, toolCalls: [{ id: "r", name: "read_file", arguments: JSON.stringify({ path: "src/b.ts" }) }] } };
+      return { message: { role: "assistant", content: "analyzed", toolCalls: [] } };
+    }
+  } as never;
+  const agent = new Agent({
+    llm,
+    systemPrompt: "rules",
+    rootDir: projectA,
+    tools: composeAgentTools((await createRepositoryNavigation(projectA))?.tools),
+    requestApproval: async () => ({ approved: true, reason: "test" }),
+    switchProject: handler
+  });
+  const result = await agent.run("switch twice then read the last project");
+  assert.equal(result.answer, "analyzed");
+  assert(toolSets[0].includes("switch_project"));
+  assert(toolSets[1].includes("switch_project"));
+  assert(toolSets[2].includes("switch_project"));
+  const first = result.messages.find((item) => item.role === "tool" && item.toolCallId === "s1");
+  const second = result.messages.find((item) => item.role === "tool" && item.toolCallId === "s2");
+  assert(first && typeof first.content === "string" && first.content.includes("Switched to"));
+  assert(second && typeof second.content === "string" && second.content.includes("Switched to"));
+  const read = result.messages.find((item) => item.role === "tool" && item.toolCallId === "r");
+  assert(read && typeof read.content === "string" && read.content.includes("export const b = 2"));
 });
 
 test("an explicit prompt requires provider and model", async () => {

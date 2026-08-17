@@ -48,6 +48,12 @@ export async function resolveProjectRoot(cwd: string, project: string): Promise<
   } catch { throw new Error(`Project directory not found: ${project}`); }
 }
 
+/** Always keeps the session-level switch_project tool available, so the Agent can switch projects repeatedly. */
+export function composeAgentTools(base?: readonly Tool[]): Tool[] {
+  const items = base ?? tools;
+  return items.some((item) => item.name === "switch_project") ? [...items] : [...items, switchProjectTool];
+}
+
 export function createSystemCredentialStore(load: () => CredentialStore = () => require("@github/keytar") as CredentialStore): CredentialStore {
   let store: CredentialStore | undefined;
   const getStore = (): CredentialStore => store ??= load();
@@ -266,7 +272,7 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   let lastProject = valid.rootDir!;
   const write = (text: string) => process.stdout.write(text);
   const view = new TuiView({ write, provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
-  const currentTools = (): Tool[] => [...(navigation?.tools ?? tools), switchProjectTool];
+  const currentTools = (): Tool[] => composeAgentTools(navigation?.tools);
   const relocate = async (path: string): Promise<string> => {
     const rootDir = await resolveProjectRoot(cwd, path);
     navigation = await createRepositoryNavigation(rootDir);
@@ -279,7 +285,7 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
       const rootDir = await relocate(path);
       view.repositoryIndexStatus(indexStatus());
       write(`Switched to project: ${rootDir}\n`);
-      return { ok: true, rootDir, tools: navigation?.tools ?? tools, notice: `Switched to project ${rootDir}. The repository index was rebuilt; the previous project's map context was cleared. Use scan_project, query_repo_map, or read_file to analyze the new project.` };
+      return { ok: true, rootDir, tools: composeAgentTools(navigation?.tools), notice: `Switched to project ${rootDir}. The repository index was rebuilt; the previous project's map context was cleared. Use scan_project, query_repo_map, or read_file to analyze the new project.` };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : "Unable to switch project" };
     }
