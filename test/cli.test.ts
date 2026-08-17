@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,7 @@ import {
   parseArgs,
   readGlobalPreference,
   resolveApiKey,
+  resolveProjectRoot,
   runWithNavigation,
   runOneShot,
   selectAndSaveModel,
@@ -313,6 +314,78 @@ test("a failed interactive command returns to the next prompt", async () => {
   assert(output.some((text) => text.includes("Error: cancelled")));
 });
 
+test("TUI switches the active project through the project action", async () => {
+  const output: string[] = [];
+  const inputs = ["/project /tmp/other", "after-switch", "/exit"];
+  const view = new TuiView({ write: (text) => output.push(text), provider: "openai" });
+  const agent = (answer: string) => ({ reset() {}, async run(prompt: string) {
+    sink({ type: "agent_start", prompt });
+    sink({ type: "model_start", turn: 1 });
+    sink({ type: "agent_end", answer, turns: 1 });
+    return { answer, messages: [], turns: 1 };
+  } }) as never;
+  let sink: (event: import("../src/agent.js").AgentEvent) => void = view.onEvent.bind(view);
+  await startTui(agent("original"), { project: "/project", provider: "openai", model: "old" }, {
+    login: async (session) => session,
+    model: async (session) => session,
+    logout: async () => undefined,
+    project: async (session, path) => ({ ...session, agent: agent("switched-answer"), project: path })
+  }, {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); }
+  }, view);
+  const text = output.join("");
+  assert.match(text, /Switched to project: \/tmp\/other/);
+  assert.match(text, /MINI-PI · openai · old · 1 turns\nswitched-answer/);
+});
+
+test("TUI reports project switching as unavailable without a wired action", async () => {
+  const output: string[] = [];
+  const inputs = ["/project /tmp/x", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await startTui({ reset() {} } as never, { project: "/project", provider: "openai", model: "gpt" }, undefined, runtime);
+  assert(output.some((text) => text.includes("Project switching is unavailable")));
+});
+
+test("a failed project switch returns to the next prompt", async () => {
+  const inputs = ["/project /missing", "/exit"];
+  const output: string[] = [];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await startTui({ reset() {} } as never, { project: "/project", provider: "deepseek", model: "old" }, {
+    login: async (session) => session,
+    model: async (session) => session,
+    logout: async () => undefined,
+    project: async () => { throw new Error("Project directory not found: /missing"); }
+  }, runtime);
+  assert(output.some((text) => text.includes("Error: Project directory not found: /missing")));
+});
+
+test("the switched project survives later login and model actions", async () => {
+  const output: string[] = [];
+  const inputs = ["/project /tmp/other", "/login", "/help", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  const agent = { reset() {} } as never;
+  await startTui(agent, { project: "/start", provider: "openai", model: "old" }, {
+    login: async (session) => ({ ...session, provider: "deepseek", model: "chat" }),
+    model: async (session) => session,
+    logout: async () => undefined,
+    project: async (session, path) => ({ ...session, project: path })
+  }, runtime);
+  const text = output.join("");
+  assert.match(text, /Switched to project: \/tmp\/other/);
+  assert.match(text, /Project: \/tmp\/other/);
+  assert(!text.includes("Project: /start"));
+});
+
 test("prompt EOF exits normally after closing its readline", async () => {
   let closed = false;
   const runtime: TuiRuntime = { createLine: () => ({ question: async () => Promise.reject({ code: "EOF" }), close: () => { closed = true; } }), write: () => undefined };
@@ -357,6 +430,19 @@ test("validateOptions rejects a missing project or provider key", async () => {
   assert.match(file.error ?? "", /Project directory/);
 });
 
+test("resolveProjectRoot canonicalizes directories and rejects missing or non-directory targets", async () => {
+  const rootDir = await realpath(await mkdtemp(join(tmpdir(), "mini-pi-project-")));
+  const spacedParent = await realpath(await mkdtemp(join(tmpdir(), "mini-pi-spaced-")));
+  const spaced = join(spacedParent, "mini pi ");
+  await mkdir(spaced);
+  assert.equal(await resolveProjectRoot(process.cwd(), rootDir), rootDir);
+  assert.equal(await resolveProjectRoot(process.cwd(), spaced), spaced);
+  assert.equal(await resolveProjectRoot(rootDir, "."), rootDir);
+  await assert.rejects(resolveProjectRoot(process.cwd(), join(rootDir, "missing")), /Project directory/);
+  await writeFile(join(rootDir, "file.ts"), "export const x = 1;");
+  await assert.rejects(resolveProjectRoot(process.cwd(), join(rootDir, "file.ts")), /Project directory/);
+});
+
 test("an explicit prompt requires provider and model", async () => {
   const result = await validateOptions(parseArgs(["--prompt", "hello"]), {}, process.cwd());
   assert.match(result.error ?? "", /--prompt requires both --provider and --model/);
@@ -372,6 +458,19 @@ test("TUI commands and blank input have stable meanings", () => {
   assert.deepEqual(parseCommand(""), { type: "empty" });
   assert.deepEqual(parseCommand("/wat"), { type: "unknown", command: "/wat" });
   assert.deepEqual(parseCommand("inspect src"), { type: "prompt", prompt: "inspect src" });
+});
+
+test("/project parses a path while preserving spaces and optional surrounding quotes", () => {
+  assert.deepEqual(parseCommand("/project /tmp/demo"), { type: "project", path: "/tmp/demo" });
+  assert.deepEqual(parseCommand('/project "/Users/jay/plugin recommend /x"'), { type: "project", path: "/Users/jay/plugin recommend /x" });
+  assert.deepEqual(parseCommand("/project /Users/jay/plugin recommend /x"), { type: "project", path: "/Users/jay/plugin recommend /x" });
+  assert.deepEqual(parseCommand("/project"), { type: "unknown", command: "/project" });
+  assert.deepEqual(parseCommand("/projecting"), { type: "unknown", command: "/projecting" });
+});
+
+test("help text advertises the project switch command", () => {
+  assert.match(helpText("/tmp/demo", "openai", "gpt"), /\/project <directory>/);
+  assert.match(helpText("/tmp/demo", "openai", "gpt"), /Project: \/tmp\/demo/);
 });
 
 test("agent events format without leaking full tool content", () => {

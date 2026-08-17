@@ -40,6 +40,14 @@ export function runWithNavigation(agent: Pick<Agent, "run">, prompt: string, nav
 export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.MINI_PI_DEBUG === "1"; }
 const require = createRequire(import.meta.url);
 
+export async function resolveProjectRoot(cwd: string, project: string): Promise<string> {
+  try {
+    const rootDir = await realpath(resolve(cwd, project));
+    if (!(await stat(rootDir)).isDirectory()) throw new Error("not a directory");
+    return rootDir;
+  } catch { throw new Error(`Project directory not found: ${project}`); }
+}
+
 export function createSystemCredentialStore(load: () => CredentialStore = () => require("@github/keytar") as CredentialStore): CredentialStore {
   let store: CredentialStore | undefined;
   const getStore = (): CredentialStore => store ??= load();
@@ -157,10 +165,7 @@ export function parseArgs(args: string[]): CliOptions {
 
 export async function validateOptions(options: CliOptions, env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), credentials?: CredentialStore): Promise<ValidatedOptions> {
   let rootDir: string;
-  try {
-    rootDir = await realpath(resolve(cwd, options.project));
-    if (!(await stat(rootDir)).isDirectory()) throw new Error("not a directory");
-  }
+  try { rootDir = await resolveProjectRoot(cwd, options.project); }
   catch { return { ...options, error: `Project directory not found: ${options.project}` }; }
   if (options.prompt && (!options.provider || !options.model)) return { ...options, rootDir, error: "--prompt requires both --provider and --model" };
   if (options.provider) {
@@ -205,6 +210,11 @@ read that candidate instead of scanning the whole project. Call query_repo_map
 once with a more precise query only when candidates are absent, ambiguous, or
 conflict with inspected evidence. Repo Map metadata is navigation evidence,
 not proof of function-body behavior.
+
+If the user asks about a project or directory outside the selected project
+root, state that you cannot read outside the current root and tell the user to
+run /project <directory> to switch to that project; you cannot open it for
+them.
 
 For full-project analysis, include:
 - a short project overview;
@@ -251,23 +261,32 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   } catch (error) { if (exitCodeFor(error) !== 130) console.error(error instanceof Error ? error.message : "Login failed"); return exitCodeFor(error); }
   if (valid.error) { console.error(valid.error); return 1; }
   const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
-  const navigation = await createRepositoryNavigation(valid.rootDir!);
-  const agentTools = navigation?.tools ?? tools;
+  let navigation = await createRepositoryNavigation(valid.rootDir!);
+  const currentTools = (): Tool[] => navigation?.tools ?? tools;
   if (valid.prompt) {
-    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, agentTools, (event) => {
+    const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, currentTools(), (event) => {
       const text = formatEvent(event, debugEnabled(env));
       if (text) console.log(text);
     }, requestApproval);
     return runOneShot(agent, valid.prompt, console.log, navigation);
   }
   const view = new TuiView({ write: (text) => process.stdout.write(text), provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir: valid.rootDir! }, agentTools, view.onEvent.bind(view), requestApproval, history) });
-  const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!);
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, rootDir: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, project: rootDir, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir }, currentTools(), view.onEvent.bind(view), requestApproval, history) });
+  const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!, valid.rootDir!);
   const skippedFiles = navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0;
+  const projectSwitch = async (current: TuiSession, path: string): Promise<TuiSession> => {
+    const rootDir = await resolveProjectRoot(cwd, path);
+    navigation = await createRepositoryNavigation(rootDir);
+    const key = await resolveApiKey(current.provider, systemCredentials, env);
+    if (!key) throw new Error(`No saved API key for ${current.provider}; run /login`);
+    view.repositoryIndexStatus({ available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles: navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0, truncated: navigation?.index.truncated ?? false });
+    return buildSession({ provider: current.provider, model: current.model }, key.apiKey, rootDir);
+  };
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model, repositoryIndexStatus: { available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles, truncated: navigation?.index.truncated ?? false } }, {
-    login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.agent.history()); },
-    model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.agent.history()); },
-    logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference)
+    login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.project, current.agent.history()); },
+    model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.project, current.agent.history()); },
+    logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference),
+    project: projectSwitch
   }, { runAgent: (agent, prompt) => runWithNavigation(agent, prompt, navigation) }, view);
 }
 
