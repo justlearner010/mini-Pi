@@ -103,6 +103,7 @@ test("classifies provider failures without retaining unsafe exception text", asy
 test("classifies every safe provider failure category", async () => {
   const cases = [
     [{ status: 403 }, "permission", "error"], [{ status: 404 }, "model", "warning"], [{ status: 429 }, "rate_limit", "warning"],
+    [{ status: 402 }, "billing", "warning"], [{ status: 400 }, "invalid_request", "warning"], [{ status: 422 }, "invalid_request", "warning"],
     [{ status: 503 }, "provider", "warning"], [{ code: "ETIMEDOUT" }, "network", "warning"], [{ code: "OTHER" }, "unknown", "warning"]
   ] as const;
   for (const [properties, kind, level] of cases) {
