@@ -7,9 +7,9 @@ import { render as renderWithMarkdansi } from "markdansi";
 import type { Agent, AgentEvent, ApprovalDecision, ApprovalRequest } from "./agent.js";
 import type { ProviderName } from "./llm.js";
 
-export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
-export type TuiSession = { agent: Agent; provider: ProviderName; model: string };
-export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined> };
+export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "project"; path: string } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
+export type TuiSession = { agent: Agent; provider: ProviderName; model: string; project: string };
+export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined>; project?: (session: TuiSession, path: string) => Promise<TuiSession> };
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type RepositoryIndexStatus = { available: boolean; indexedFiles: number; skippedFiles: number; truncated: boolean };
@@ -250,7 +250,17 @@ export function parseCommand(input: string): TuiCommand {
   if (text === "/login") return { type: "login" };
   if (text === "/model") return { type: "model" };
   if (text === "/logout") return { type: "logout" };
+  if (text === "/project" || text.startsWith("/project ")) {
+    const path = unquotePath(text.slice("/project".length).trimStart());
+    if (path) return { type: "project", path };
+  }
   return text.startsWith("/") ? { type: "unknown", command: text } : { type: "prompt", prompt: text };
+}
+
+/** Strips one pair of matching surrounding quotes, preserving internal spaces such as a trailing space in a directory name. */
+function unquotePath(value: string): string {
+  if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.endsWith(value[0])) return value.slice(1, -1);
+  return value;
 }
 
 export function formatEvent(event: AgentEvent, debug = false): string {
@@ -284,13 +294,13 @@ export async function askApiKey(): Promise<string> { return password({ message: 
 export async function chooseStoredProvider(providers: ProviderName[]): Promise<ProviderName> { return select({ message: "Provider to log out", choices: providers.map((value) => ({ name: value, value })) }); }
 
 export function helpText(project: string, provider: ProviderName, model: string): string {
-  return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /help, /reset, /exit`;
+  return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /project <directory>, /help, /reset, /exit`;
 }
 
 export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string; repositoryIndexStatus?: RepositoryIndexStatus }, actions?: TuiActions, runtime: TuiRuntime = {}, view = new TuiView({ write: runtime.write ?? ((text) => { stdout.write(text); }), provider: config.provider, model: config.model, renderMarkdown: runtime.renderMarkdown })): Promise<number> {
   const createLine = runtime.createLine ?? (() => createInterface({ input: stdin, output: stdout }));
   const write = runtime.write ?? ((text: string) => { stdout.write(text); });
-  let session: TuiSession = { agent, provider: config.provider, model: config.model };
+  let session: TuiSession = { agent, provider: config.provider, model: config.model, project: config.project };
   write("mini-Pi ready. /help for commands.\n");
   if (config.repositoryIndexStatus) view.repositoryIndexStatus(config.repositoryIndexStatus);
   while (true) {
@@ -303,7 +313,7 @@ export async function startTui(agent: Agent, config: { project: string; provider
     } finally { line.close(); }
       const command = parseCommand(input);
       if (command.type === "exit") return 0;
-      if (command.type === "help") { write(`${helpText(config.project, session.provider, session.model)}\n`); continue; }
+      if (command.type === "help") { write(`${helpText(session.project, session.provider, session.model)}\n`); continue; }
       if (command.type === "reset") { session.agent.reset(); view.clearActivity(); write("Conversation reset.\n"); continue; }
       if (command.type === "empty") { view.toggleLatestActivity(); continue; }
       if (command.type === "unknown") { write(`Unknown command: ${command.command}\n`); continue; }
@@ -315,6 +325,15 @@ export async function startTui(agent: Agent, config: { project: string; provider
       if (command.type === "logout") {
         try { const provider = await actions!.logout(); write(provider ? `${provider} credentials removed. Current session remains active.\n` : "No stored credentials to remove.\n"); }
         catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
+        continue;
+      }
+      if (command.type === "project") {
+        try {
+          if (!actions?.project) { write("Project switching is unavailable in this mode.\n"); continue; }
+          session = await actions.project(session, command.path);
+          view.updateSession(session.provider, session.model);
+          write(`Switched to project: ${session.project}\n`);
+        } catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
         continue;
       }
       if (command.type !== "prompt") continue;
