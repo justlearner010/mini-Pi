@@ -15,6 +15,15 @@ export interface ApprovalDecision {
 }
 export type RequestApproval = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
+/** Outcome of an agent-driven project switch. `ok: true` carries the new root and tool set. */
+export interface SwitchProjectResult {
+  ok: boolean;
+  rootDir?: string;
+  tools?: Tool[];
+  notice?: string;
+  error?: string;
+}
+
 export type AgentEvent =
   | { type: "agent_start"; prompt: string }
   | { type: "model_start"; turn: number }
@@ -31,6 +40,7 @@ export interface AgentConfig {
   maxTurns?: number;
   onEvent?: (event: AgentEvent) => void;
   requestApproval?: RequestApproval;
+  switchProject?: (path: string) => Promise<SwitchProjectResult>;
   messages?: Message[];
 }
 export const DEFAULT_MAX_TURNS = 16;
@@ -50,12 +60,14 @@ function isApprovalDecision(value: unknown): value is ApprovalDecision {
 
 export class Agent {
   private readonly llm: LLMClient;
-  private readonly tools: Tool[];
+  private tools: Tool[];
   private readonly systemPrompt: string;
-  private readonly rootDir: string;
+  private rootDir: string;
   private readonly maxTurns: number;
   private readonly onEvent?: (event: AgentEvent) => void;
   private readonly requestApproval?: RequestApproval;
+  private readonly switchProject?: (path: string) => Promise<SwitchProjectResult>;
+  private transientContext?: string;
   private messages: Message[];
 
   constructor(config: AgentConfig) {
@@ -66,6 +78,7 @@ export class Agent {
     this.maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
     this.onEvent = config.onEvent;
     this.requestApproval = config.requestApproval;
+    this.switchProject = config.switchProject;
     this.messages = structuredClone(config.messages ?? [{ role: "system", content: this.systemPrompt }]);
   }
 
@@ -75,6 +88,7 @@ export class Agent {
   async run(prompt: string, options: AgentRunOptions = {}): Promise<AgentResult> {
     const transientContext = options.transientContext?.trim() || undefined;
     if (transientContext && transientContext.length > 8_000) throw new Error("Transient context exceeds 8,000 characters");
+    this.transientContext = transientContext;
     const start = this.messages.length;
     const historyReplacements = new Map<string, string>();
     this.emit({ type: "agent_start", prompt });
@@ -86,7 +100,7 @@ export class Agent {
         const turn = turns + 1;
         this.emit({ type: "model_start", turn });
         let response;
-        try { response = await this.llm.generate(this.requestMessages(transientContext), this.tools); }
+        try { response = await this.llm.generate(this.requestMessages(), this.tools); }
         catch (error) { throw error instanceof ProviderDiagnostic ? { stage: "model", turn, message: error.message, diagnostic: error } : { stage: "model", message: "Model request failed" }; }
         turns += 1;
         const message = response.message;
@@ -117,9 +131,9 @@ export class Agent {
     }
   }
 
-  private requestMessages(transientContext?: string): Message[] {
+  private requestMessages(): Message[] {
     const messages = structuredClone(this.messages);
-    if (transientContext) messages.splice(1, 0, { role: "system", content: `Current-run repository navigation context:\n${transientContext}` });
+    if (this.transientContext) messages.splice(1, 0, { role: "system", content: `Current-run repository navigation context:\n${this.transientContext}` });
     return messages;
   }
 
@@ -148,11 +162,25 @@ export class Agent {
         if (!approved.approved) throw new Error(`User declined ${tool.name}: approval denied`);
       }
       this.emit({ type: "tool_start", turn, toolCallId: call.id, toolName: call.name });
-      const output = await tool.execute(args, { rootDir: this.rootDir });
-      isError = output.isError;
-      result = output.isError ? `Tool error: ${content(output.content)}` : content(output.content);
-      message = output.isError ? summary(output.content) : "completed";
-      if (typeof output.historyContent === "string") historyContent = [...output.historyContent].slice(0, 512).join("");
+      if (call.name === "switch_project") {
+        if (!this.switchProject) throw new Error("Project switching is unavailable");
+        const switchPath = (args as { path?: unknown })?.path;
+        if (typeof switchPath !== "string" || !switchPath.trim()) throw new Error("switch_project requires a nonempty path");
+        const switched = await this.switchProject(switchPath);
+        if (!switched.ok) throw new Error(switched.error ?? "Unable to switch project");
+        this.rootDir = switched.rootDir!;
+        this.tools = switched.tools!;
+        this.transientContext = undefined;
+        isError = false;
+        result = switched.notice ?? `Switched to project ${switched.rootDir}`;
+        message = "switched";
+      } else {
+        const output = await tool.execute(args, { rootDir: this.rootDir });
+        isError = output.isError;
+        result = output.isError ? `Tool error: ${content(output.content)}` : content(output.content);
+        message = output.isError ? summary(output.content) : "completed";
+        if (typeof output.historyContent === "string") historyContent = [...output.historyContent].slice(0, 512).join("");
+      }
     } catch (error) {
       isError = true;
       message = error instanceof Error ? error.message : "Tool failed";

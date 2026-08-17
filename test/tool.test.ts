@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { analyzeDependenciesTool, buildRepositoryIndex, classifyFileArea, createQueryRepoMapTool, deriveQueryIntent, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
+import { analyzeDependenciesTool, buildRepositoryIndex, classifyFileArea, createQueryRepoMapTool, deriveQueryIntent, discoverRepositorySources, findCycles, queryRepositoryIndex, readFileTool, REPOSITORY_INDEX_LIMITS, scanProjectTool, switchProjectTool, type RepoMapResult, type RepositoryIndexLimits } from "../src/tool.js";
 
 async function project(files: Record<string, string | Buffer> = {}) {
   const rootDir = await mkdtemp(join(tmpdir(), "mini-pi-tool-"));
@@ -671,4 +671,12 @@ test("dependency analysis validates an entry, constrains it to path, and renders
   assert.equal((await analyzeDependenciesTool.execute({ entry: "other.ts" }, { rootDir })).isError, false);
   assert.equal((await analyzeDependenciesTool.execute({ path: "src", entry: "other.ts" }, { rootDir })).isError, true);
   assert.equal((await analyzeDependenciesTool.execute({ entry: "missing.ts" }, { rootDir })).isError, true);
+});
+
+test("switch_project exposes a SENSITIVE schema and a stub that never executes", async () => {
+  assert.equal(switchProjectTool.name, "switch_project");
+  assert.equal(switchProjectTool.permission, "SENSITIVE");
+  assert.equal((switchProjectTool.parameters as { required: string[] }).required[0], "path");
+  const result = await switchProjectTool.execute({ path: "/x" }, { rootDir: "/p" });
+  assert.equal(result.isError, true);
 });

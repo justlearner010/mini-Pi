@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { Agent, type AgentEvent, type AgentResult, type ApprovalRequest } from "../src/agent.js";
 import { ProviderDiagnostic, type LLMClient, type Message, type ModelResponse } from "../src/llm.js";
-import { tools, type Tool } from "../src/tool.js";
+import { switchProjectTool, tools, type Tool } from "../src/tool.js";
 
 function response(content: string | null, toolCalls: ModelResponse["message"]["toolCalls"] = []): ModelResponse {
   return { message: { role: "assistant", content, toolCalls } };
@@ -122,6 +122,61 @@ test("object approval decisions deny tools without executing and return a safe d
   assert.deepEqual(events.filter((event) => event.type === "tool_start" || event.type === "tool_end"), [
     { type: "tool_end", turn: 1, toolCallId: "declined", toolName: "guarded", isError: true, message: "User declined guarded: approval denied" }
   ]);
+});
+
+test("switch_project swaps the root and tools after approval and clears stale context", async () => {
+  const calls: string[] = [];
+  const fake = fakeLLM([
+    response(null, [{ id: "sw", name: "switch_project", arguments: '{"path":"/other"}' }]),
+    response(null, [{ id: "rd", name: "read", arguments: '{"path":"a.ts"}' }]),
+    response("done")
+  ]);
+  const approvals: ApprovalRequest[] = [];
+  const switchedTools = [tool("read", async (_args, context) => { calls.push(`read:${context.rootDir}`); return { content: "ok", isError: false }; })];
+  const agent = new Agent({
+    llm: fake.llm,
+    tools: [switchProjectTool, tool("read", async (_args, context) => { calls.push(`read:${context.rootDir}`); return { content: "ok", isError: false }; })],
+    systemPrompt: "rules",
+    rootDir: "/old",
+    requestApproval: async (request) => { approvals.push(request); return { approved: true, reason: "confirmed" }; },
+    switchProject: async (path) => ({ ok: true, rootDir: path, tools: switchedTools, notice: `Switched to ${path}; index rebuilt` })
+  });
+  const result = await agent.run("go", { transientContext: "STALE MAP CONTENT" });
+  assert.equal(result.answer, "done");
+  assert.deepEqual(approvals, [{ toolName: "switch_project", permission: "SENSITIVE", reason: "Repoints the project root the agent reads to another directory.", risk: "After approval, the agent can read files under the new directory and send their contents to the Provider.", arguments: { path: "/other" } }]);
+  assert.deepEqual(calls, ["read:/other"]);
+  const switchedMessage = result.messages.find((item) => item.role === "tool" && item.toolCallId === "sw");
+  assert(switchedMessage && typeof switchedMessage.content === "string" && switchedMessage.content.includes("Switched to /other"));
+  assert(!JSON.stringify(fake.requests[1]).includes("STALE MAP CONTENT"));
+  assert(!JSON.stringify(fake.requests[2]).includes("STALE MAP CONTENT"));
+});
+
+test("switch_project fails closed without a handler", async () => {
+  const fake = fakeLLM([response(null, [{ id: "sw", name: "switch_project", arguments: '{"path":"/other"}' }]), response("recovered")]);
+  const agent = new Agent({ llm: fake.llm, tools: [switchProjectTool], systemPrompt: "rules", rootDir: "/old", requestApproval: async () => ({ approved: true, reason: "ok" }) });
+  const result = await agent.run("go");
+  assert.equal(result.answer, "recovered");
+  const message = result.messages.find((item) => item.role === "tool" && item.toolCallId === "sw");
+  assert(message && typeof message.content === "string" && /Tool error: Project switching is unavailable/.test(message.content));
+});
+
+test("switch_project surfaces a handler failure to the model", async () => {
+  const fake = fakeLLM([response(null, [{ id: "sw", name: "switch_project", arguments: '{"path":"/missing"}' }]), response("recovered")]);
+  const agent = new Agent({ llm: fake.llm, tools: [switchProjectTool], systemPrompt: "rules", rootDir: "/old", requestApproval: async () => ({ approved: true, reason: "ok" }), switchProject: async () => ({ ok: false, error: "Project directory not found: /missing" }) });
+  const result = await agent.run("go");
+  assert.equal(result.answer, "recovered");
+  const message = result.messages.find((item) => item.role === "tool" && item.toolCallId === "sw");
+  assert(message && typeof message.content === "string" && /Tool error: Project directory not found/.test(message.content));
+});
+
+test("switch_project requires approval and a denial blocks the switch", async () => {
+  const fake = fakeLLM([response(null, [{ id: "sw", name: "switch_project", arguments: '{"path":"/other"}' }]), response("recovered")]);
+  let switched = 0;
+  const agent = new Agent({ llm: fake.llm, tools: [switchProjectTool], systemPrompt: "rules", rootDir: "/old", requestApproval: async () => ({ approved: false, reason: "not now" }), switchProject: async () => { switched += 1; return { ok: true, rootDir: "/other", tools: [] }; } });
+  const result = await agent.run("go");
+  assert.equal(switched, 0);
+  const message = result.messages.find((item) => item.role === "tool" && item.toolCallId === "sw");
+  assert(message && typeof message.content === "string" && /User declined switch_project/.test(message.content));
 });
 
 test("unknown runtime permissions fail closed without asking or executing", async () => {

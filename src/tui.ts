@@ -4,7 +4,7 @@ import select from "@inquirer/select";
 import password from "@inquirer/password";
 import { render as renderWithMarkdansi } from "markdansi";
 
-import type { Agent, AgentEvent, ApprovalDecision, ApprovalRequest } from "./agent.js";
+import type { Agent, AgentEvent, AgentResult, ApprovalDecision, ApprovalRequest } from "./agent.js";
 import type { ProviderName } from "./llm.js";
 
 export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "project"; path: string } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
@@ -13,7 +13,7 @@ export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; 
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type RepositoryIndexStatus = { available: boolean; indexedFiles: number; skippedFiles: number; truncated: boolean };
-export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer; runAgent?: (agent: Agent, prompt: string) => ReturnType<Agent["run"]> };
+export type TuiRuntime = { createLine?: () => TuiLine; write?: (text: string) => void; renderMarkdown?: MarkdownRenderer; runAgent?: (agent: Agent, prompt: string) => Promise<AgentResult | { result: AgentResult; project?: string }> };
 export type TuiViewRuntime = { write: (text: string) => void; now?: () => Date; provider?: ProviderName; model?: string; debug?: boolean; renderMarkdown?: MarkdownRenderer };
 
 const tuiColor = { user: "\x1b[38;5;110m", assistant: "\x1b[38;5;141m", activity: "\x1b[38;5;245m", approval: "\x1b[38;5;179m", error: "\x1b[38;5;203m", reset: "\x1b[0m" };
@@ -338,8 +338,13 @@ export async function startTui(agent: Agent, config: { project: string; provider
       }
       if (command.type !== "prompt") continue;
       try {
-        const result = await (runtime.runAgent ? runtime.runAgent(session.agent, command.prompt) : session.agent.run(command.prompt));
-        view.renderTurn(command.prompt, result.answer, result.turns);
+        const outcome = runtime.runAgent ? await runtime.runAgent(session.agent, command.prompt) : await session.agent.run(command.prompt);
+        if ("result" in outcome) {
+          if (outcome.project) session = { ...session, project: outcome.project };
+          view.renderTurn(command.prompt, outcome.result.answer, outcome.result.turns);
+        } else {
+          view.renderTurn(command.prompt, outcome.answer, outcome.turns);
+        }
       }
       catch (error) {
         if (!view.hasHandledError()) view.renderUnhandledError(error instanceof Error ? error.message : "Agent failed");
