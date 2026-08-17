@@ -6,9 +6,9 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { Agent, type AgentEvent, type RequestApproval } from "./agent.js";
+import { Agent, type AgentEvent, type RequestApproval, type SwitchProjectResult } from "./agent.js";
 import { createLLM, listModels, type ProviderName } from "./llm.js";
-import { buildRepositoryIndex, createQueryRepoMapTool, queryRepositoryIndex, tools, type RepoMapResult, type RepositoryIndex, type Tool } from "./tool.js";
+import { buildRepositoryIndex, createQueryRepoMapTool, queryRepositoryIndex, switchProjectTool, tools, type RepoMapResult, type RepositoryIndex, type Tool } from "./tool.js";
 import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, TuiView, type TuiSession } from "./tui.js";
 
 export type CliOptions = { project: string; provider?: ProviderName; model?: string; prompt?: string; help: boolean; version: boolean };
@@ -212,9 +212,10 @@ conflict with inspected evidence. Repo Map metadata is navigation evidence,
 not proof of function-body behavior.
 
 If the user asks about a project or directory outside the selected project
-root, state that you cannot read outside the current root and tell the user to
-run /project <directory> to switch to that project; you cannot open it for
-them.
+root, call switch_project with that path. The user approves the switch; once
+approved, the root changes, the repository index is rebuilt, and you can
+analyze the new project normally. Never try to read outside the current root
+without switching.
 
 For full-project analysis, include:
 - a short project overview;
@@ -223,8 +224,8 @@ For full-project analysis, include:
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
 function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
-function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, agentTools: Tool[], onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>): Agent {
-  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools: agentTools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, messages });
+function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, agentTools: Tool[], onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>, switchProject?: (path: string) => Promise<SwitchProjectResult>): Agent {
+  return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools: agentTools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, switchProject, messages });
 }
 
 export async function runOneShot(agent: Pick<Agent, "run">, prompt: string, write: (text: string) => void = console.log, navigation?: RepositoryNavigation): Promise<number> {
@@ -262,32 +263,50 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
   if (valid.error) { console.error(valid.error); return 1; }
   const requestApproval: RequestApproval = (request) => requestTerminalApproval(request);
   let navigation = await createRepositoryNavigation(valid.rootDir!);
-  const currentTools = (): Tool[] => navigation?.tools ?? tools;
+  let lastProject = valid.rootDir!;
+  const write = (text: string) => process.stdout.write(text);
+  const view = new TuiView({ write, provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
+  const currentTools = (): Tool[] => [...(navigation?.tools ?? tools), switchProjectTool];
+  const relocate = async (path: string): Promise<string> => {
+    const rootDir = await resolveProjectRoot(cwd, path);
+    navigation = await createRepositoryNavigation(rootDir);
+    lastProject = rootDir;
+    return rootDir;
+  };
+  const indexStatus = () => ({ available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles: navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0, truncated: navigation?.index.truncated ?? false });
+  const switchProjectHandler = async (path: string): Promise<SwitchProjectResult> => {
+    try {
+      const rootDir = await relocate(path);
+      view.repositoryIndexStatus(indexStatus());
+      write(`Switched to project: ${rootDir}\n`);
+      return { ok: true, rootDir, tools: navigation?.tools ?? tools, notice: `Switched to project ${rootDir}. The repository index was rebuilt; the previous project's map context was cleared. Use scan_project, query_repo_map, or read_file to analyze the new project.` };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : "Unable to switch project" };
+    }
+  };
   if (valid.prompt) {
     const agent = makeAgent({ provider: valid.provider!, model: valid.model!, apiKey: valid.apiKey!, rootDir: valid.rootDir! }, currentTools(), (event) => {
       const text = formatEvent(event, debugEnabled(env));
       if (text) console.log(text);
-    }, requestApproval);
+    }, requestApproval, undefined, switchProjectHandler);
     return runOneShot(agent, valid.prompt, console.log, navigation);
   }
-  const view = new TuiView({ write: (text) => process.stdout.write(text), provider: valid.provider!, model: valid.model!, debug: debugEnabled(env) });
-  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, rootDir: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, project: rootDir, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir }, currentTools(), view.onEvent.bind(view), requestApproval, history) });
+  const buildSession = (selection: StartupSelection | GlobalPreference, apiKey: string, rootDir: string, history?: ReturnType<Agent["history"]>): TuiSession => ({ provider: selection.provider, model: selection.model, project: rootDir, agent: makeAgent({ provider: selection.provider, model: selection.model, apiKey, rootDir }, currentTools(), view.onEvent.bind(view), requestApproval, history, switchProjectHandler) });
   const session = buildSession({ provider: valid.provider!, model: valid.model! }, valid.apiKey!, valid.rootDir!);
   const skippedFiles = navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0;
   const projectSwitch = async (current: TuiSession, path: string): Promise<TuiSession> => {
-    const rootDir = await resolveProjectRoot(cwd, path);
-    navigation = await createRepositoryNavigation(rootDir);
+    const rootDir = await relocate(path);
     const key = await resolveApiKey(current.provider, systemCredentials, env);
     if (!key) throw new Error(`No saved API key for ${current.provider}; run /login`);
-    view.repositoryIndexStatus({ available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles: navigation ? Object.values(navigation.index.skipped).reduce((sum, value) => sum + value, 0) : 0, truncated: navigation?.index.truncated ?? false });
+    view.repositoryIndexStatus(indexStatus());
     return buildSession({ provider: current.provider, model: current.model }, key.apiKey, rootDir);
   };
-  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model, repositoryIndexStatus: { available: Boolean(navigation), indexedFiles: navigation?.index.inspectedFileCount ?? 0, skippedFiles, truncated: navigation?.index.truncated ?? false } }, {
+  return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model, repositoryIndexStatus: indexStatus() }, {
     login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.project, current.agent.history()); },
     model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.project, current.agent.history()); },
     logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference),
     project: projectSwitch
-  }, { runAgent: (agent, prompt) => runWithNavigation(agent, prompt, navigation) }, view);
+  }, { runAgent: async (agent, prompt) => ({ result: await runWithNavigation(agent, prompt, navigation), project: lastProject }) }, view);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) run().then((code) => { process.exitCode = code; });

@@ -570,6 +570,20 @@ test("startTui delegates user prompts to the navigation-aware run callback", asy
   assert.deepEqual(prompts, ["where is provider configuration?"]);
 });
 
+test("startTui adopts the project reported by the run callback", async () => {
+  const output: string[] = [];
+  const inputs = ["question", "/help", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); },
+    runAgent: async () => ({ result: { answer: "done", messages: [], turns: 1 }, project: "/new-project" })
+  };
+  await startTui({ reset() {} } as never, { project: "/start", provider: "openai", model: "gpt" }, undefined, runtime);
+  const text = output.join("");
+  assert.match(text, /Project: \/new-project/);
+  assert(!text.includes("Project: /start"));
+});
+
 test("TuiView forwards MINI_PI_DEBUG to diagnostic formatting", () => {
   const output: string[] = [];
   const view = new TuiView({ write: (text) => output.push(text), debug: true });

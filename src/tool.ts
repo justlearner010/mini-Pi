@@ -855,4 +855,27 @@ export const analyzeDependenciesTool: Tool = {
   }
 };
 
+/**
+ * Session-level tool that repoints the Agent at another project directory.
+ * The Agent runtime intercepts this call (see `Agent.execute`), so this
+ * execute stub is never invoked by the loop; it exists to expose the schema,
+ * permission, and approval copy to the model and the approval prompt.
+ */
+export const switchProjectTool: Tool = {
+  name: "switch_project",
+  description: "Switch the active project root to another directory and rebuild the repository index. Call this when the user asks about a project or directory outside the current project root; the user approves the new path before it is applied.",
+  permission: "SENSITIVE",
+  reason: "Repoints the project root the agent reads to another directory.",
+  risk: "After approval, the agent can read files under the new directory and send their contents to the Provider.",
+  parameters: {
+    type: "object",
+    properties: { path: { type: "string", description: "Absolute or relative path to a project directory" } },
+    required: ["path"],
+    additionalProperties: false
+  },
+  async execute() {
+    return { content: "switch_project is handled by the agent runtime and is unavailable here", isError: true };
+  }
+};
+
 export const tools: Tool[] = [scanProjectTool, readFileTool, analyzeDependenciesTool];
