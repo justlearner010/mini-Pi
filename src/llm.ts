@@ -9,7 +9,7 @@ export interface LLMConfig {
   model: string;
   apiKey: string;
 }
-export type DiagnosticKind = "authentication" | "permission" | "model" | "rate_limit" | "provider" | "network" | "unknown";
+export type DiagnosticKind = "authentication" | "billing" | "permission" | "model" | "invalid_request" | "rate_limit" | "provider" | "network" | "unknown";
 export type DiagnosticLevel = "warning" | "error";
 export type ProviderDiagnosticData = { provider: ProviderName; level: DiagnosticLevel; kind: DiagnosticKind; message: string; reason: string; advice: string; status?: number; code?: string; requestId?: string };
 export class ProviderDiagnostic extends Error {
@@ -96,7 +96,7 @@ function diagnostic(provider: ProviderName, error: unknown): ProviderDiagnostic 
   const rawCode = typeof raw?.code === "string" ? raw.code : "", code = codeOf(rawCode), requestId = undefined;
   const network = /network|timeout|timed out|connection|socket|fetch/i.test(typeof raw?.message === "string" ? raw.message : "") || /^(E(?:CONN|TIME|HOST|NET)|ENOTFOUND|ECONN)/.test(rawCode);
   const name = provider === "openai" ? "OpenAI" : "DeepSeek";
-  const [kind, level, message, reason, advice]: [DiagnosticKind, DiagnosticLevel, string, string, string] = status === 401 ? ["authentication", "error", `${name} 认证失败`, "API Key 无效、过期，或不属于当前 Provider。", `运行 /login 重新保存 ${name} 的 API Key。`] : status === 403 ? ["permission", "error", "Provider 权限不足", "当前 Key 没有访问该资源的权限。", "确认 Key 的权限、账号状态和 Provider 是否正确。"] : status === 404 ? ["model", "warning", "模型不可用", "模型名不存在或当前 Key 无权使用。", "运行 /model 重新选择可用模型。"] : status === 429 ? ["rate_limit", "warning", `${name} 请求受限`, "当前请求被限流、余额或并发限制。", "稍后重试，或切换模型 / Provider。"] : status !== undefined && status >= 500 ? ["provider", "warning", "Provider 暂时不可用", "Provider 服务端暂时发生故障。", "稍后重试。"] : network ? ["network", "warning", "网络请求失败", "无法连接到 Provider 或请求超时。", "检查网络、代理和 Provider API 地址后重试。"] : ["unknown", "warning", "Provider 请求失败", "Provider 返回了无法分类的错误。", "查看调试信息或稍后重试。"];
+  const [kind, level, message, reason, advice]: [DiagnosticKind, DiagnosticLevel, string, string, string] = status === 401 ? ["authentication", "error", `${name} 认证失败`, "API Key 无效、过期，或不属于当前 Provider。", `运行 /login 重新保存 ${name} 的 API Key。`] : status === 402 ? ["billing", "warning", `${name} 账户余额不足`, "当前账户余额不足，无法继续调用该模型。", "充值后再试，或切换 Provider / 模型。"] : status === 403 ? ["permission", "error", "Provider 权限不足", "当前 Key 没有访问该资源的权限。", "确认 Key 的权限、账号状态和 Provider 是否正确。"] : status === 404 ? ["model", "warning", "模型不可用", "模型名不存在或当前 Key 无权使用。", "运行 /model 重新选择可用模型。"] : status === 400 || status === 422 ? ["invalid_request", "warning", `${name} 拒绝了请求`, "请求参数不被接受，可能是不支持的参数、消息格式或工具定义。", "运行 /model 切换模型重试；若反复出现，可能是工具定义与 Provider 不兼容。"] : status === 429 ? ["rate_limit", "warning", `${name} 请求受限`, "当前请求被限流、余额或并发限制。", "稍后重试，或切换模型 / Provider。"] : status !== undefined && status >= 500 ? ["provider", "warning", "Provider 暂时不可用", "Provider 服务端暂时发生故障。", "稍后重试。"] : network ? ["network", "warning", "网络请求失败", "无法连接到 Provider 或请求超时。", "检查网络、代理和 Provider API 地址后重试。"] : ["unknown", "warning", "Provider 请求失败", "Provider 返回了无法分类的错误。", "查看调试信息或稍后重试。"];
   return new ProviderDiagnostic({ provider, level, kind, message, reason, advice, ...(status === undefined ? {} : { status }), ...(code ? { code } : {}), ...(requestId ? { requestId } : {}) });
 }
 

@@ -480,6 +480,14 @@ test("agent events format without leaking full tool content", () => {
   assert.equal(formatEvent({ type: "agent_end", answer: "done", turns: 3 }), "Completed · 3 turns");
 });
 
+test("billing and invalid-request diagnostics render safe Chinese labels", () => {
+  const billing = formatEvent({ type: "error", stage: "model", turn: 1, message: "DeepSeek 账户余额不足", diagnostic: { level: "warning", kind: "billing", provider: "deepseek", message: "DeepSeek 账户余额不足", reason: "当前账户余额不足，无法继续调用该模型。", advice: "充值后再试，或切换 Provider / 模型。", status: 402 } });
+  const invalid = formatEvent({ type: "error", stage: "model", turn: 1, message: "DeepSeek 拒绝了请求", diagnostic: { level: "warning", kind: "invalid_request", provider: "deepseek", message: "DeepSeek 拒绝了请求", reason: "请求参数不被接受。", advice: "运行 /model 切换模型重试。", status: 400 } });
+  assert.match(billing, /警告 \[余额不足\]/);
+  assert.match(invalid, /警告 \[请求无效\]/);
+  assert(!billing.includes("HTTP 402") && !invalid.includes("HTTP 400"));
+});
+
 test("plain event formatting removes terminal controls from tool names and error summaries", () => {
   const malicious = "read\u001b]8;;https://bad\u0007_file\u001b[2J\u0000\u200b";
   const tool = formatEvent({ type: "tool_end", turn: 1, toolCallId: "call", toolName: malicious, isError: true, message: `failed\u009b31m\u001b]0;bad\u0007${malicious}` });

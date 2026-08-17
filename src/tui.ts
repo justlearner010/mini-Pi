@@ -276,7 +276,7 @@ function formatUnsafeEvent(event: AgentEvent, debug: boolean): string {
   if (event.type === "tool_end") return event.isError ? `✗ ${event.toolName}: ${event.message}` : `✓ ${event.toolName}`;
   if (event.type === "agent_end") return `Completed · ${event.turns} turns`;
   if (!event.diagnostic) return `Error: ${event.message}`;
-  const label = { authentication: "认证失败", permission: "权限不足", model: "模型不可用", rate_limit: "限流", provider: "Provider 暂时不可用", network: "网络请求失败", unknown: "未知 Provider 错误" }[event.diagnostic.kind];
+  const label = { authentication: "认证失败", billing: "余额不足", permission: "权限不足", model: "模型不可用", invalid_request: "请求无效", rate_limit: "限流", provider: "Provider 暂时不可用", network: "网络请求失败", unknown: "未知 Provider 错误" }[event.diagnostic.kind];
   const provider = event.diagnostic.provider === "openai" ? "OpenAI" : "DeepSeek";
   const safeCode = ["invalid_api_key", "rate_limit_exceeded", "model_not_found"].includes(event.diagnostic.code ?? "") ? event.diagnostic.code : undefined;
   const details = [event.diagnostic.status === undefined ? "" : `HTTP ${event.diagnostic.status}`, safeCode ? `code=${safeCode}` : ""].filter(Boolean).join(" · ");
