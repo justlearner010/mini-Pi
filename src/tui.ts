@@ -5,11 +5,11 @@ import password from "@inquirer/password";
 import { render as renderWithMarkdansi } from "markdansi";
 
 import type { Agent, AgentEvent, AgentResult, ApprovalDecision, ApprovalRequest } from "./agent.js";
-import type { ProviderName } from "./llm.js";
+import { listProviderIds, listProviders, providerDisplayName, type ProviderName } from "./llm.js";
 
-export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "project"; path: string } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
+export type TuiCommand = { type: "help" | "reset" | "exit" | "login" | "model" | "logout" | "empty" } | { type: "project"; path: string } | { type: "provider"; id?: string } | { type: "unknown"; command: string } | { type: "prompt"; prompt: string };
 export type TuiSession = { agent: Agent; provider: ProviderName; model: string; project: string };
-export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined>; project?: (session: TuiSession, path: string) => Promise<TuiSession> };
+export type TuiActions = { login: (session: TuiSession) => Promise<TuiSession>; model: (session: TuiSession) => Promise<TuiSession>; logout: () => Promise<ProviderName | undefined>; project?: (session: TuiSession, path: string) => Promise<TuiSession>; provider?: (session: TuiSession, id: string) => Promise<TuiSession>; };
 export type TuiLine = { question: (prompt: string) => Promise<string>; close: () => void };
 export type MarkdownRenderer = (text: string) => string;
 export type RepositoryIndexStatus = { available: boolean; indexedFiles: number; skippedFiles: number; truncated: boolean };
@@ -254,6 +254,11 @@ export function parseCommand(input: string): TuiCommand {
     const path = unquotePath(text.slice("/project".length).trimStart());
     if (path) return { type: "project", path };
   }
+  if (text === "/provider" || text.startsWith("/provider ")) {
+    const id = text.slice("/provider".length).trimStart();
+    if (id === "") return { type: "provider" };
+    if (listProviderIds().includes(id)) return { type: "provider", id };
+  }
   return text.startsWith("/") ? { type: "unknown", command: text } : { type: "prompt", prompt: text };
 }
 
@@ -277,24 +282,27 @@ function formatUnsafeEvent(event: AgentEvent, debug: boolean): string {
   if (event.type === "agent_end") return `Completed · ${event.turns} turns`;
   if (!event.diagnostic) return `Error: ${event.message}`;
   const label = { authentication: "认证失败", billing: "余额不足", permission: "权限不足", model: "模型不可用", invalid_request: "请求无效", rate_limit: "限流", provider: "Provider 暂时不可用", network: "网络请求失败", unknown: "未知 Provider 错误" }[event.diagnostic.kind];
-  const provider = event.diagnostic.provider === "openai" ? "OpenAI" : "DeepSeek";
+  const provider = providerDisplayName(event.diagnostic.provider);
   const safeCode = ["invalid_api_key", "rate_limit_exceeded", "model_not_found"].includes(event.diagnostic.code ?? "") ? event.diagnostic.code : undefined;
   const details = [event.diagnostic.status === undefined ? "" : `HTTP ${event.diagnostic.status}`, safeCode ? `code=${safeCode}` : ""].filter(Boolean).join(" · ");
   return `${event.diagnostic.level === "error" ? "错误" : "警告"} [${label}]\n位置：${provider}，第 ${event.turn} 次模型请求\n原因：${event.diagnostic.reason}\n建议：${event.diagnostic.advice}${debug && details ? `\n调试：${details}` : ""}`;
 }
 
 export async function chooseProvider(): Promise<ProviderName> {
-  return select({ message: "Provider", choices: [{ name: "OpenAI", value: "openai" }, { name: "DeepSeek", value: "deepseek" }] });
+  return select({
+    message: "Provider",
+    choices: listProviders().map((spec) => ({ name: spec.name, value: spec.id }))
+  });
 }
 
 export async function chooseModel(models: string[]): Promise<string> {
   return select({ message: "Model", choices: models.map((value) => ({ name: value, value })) });
 }
 export async function askApiKey(): Promise<string> { return password({ message: "API Key", mask: "*" }); }
-export async function chooseStoredProvider(providers: ProviderName[]): Promise<ProviderName> { return select({ message: "Provider to log out", choices: providers.map((value) => ({ name: value, value })) }); }
+export async function chooseStoredProvider(providers: ProviderName[]): Promise<ProviderName> { return select({ message: "Provider to log out", choices: providers.map((value) => ({ name: providerDisplayName(value), value })) }); }
 
 export function helpText(project: string, provider: ProviderName, model: string): string {
-  return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /logout, /project <directory>, /help, /reset, /exit`;
+  return `Project: ${project}\nProvider: ${provider}\nModel: ${model}\nAsk about the project. Commands: /login, /model, /provider [id], /logout, /project <directory>, /help, /reset, /exit`;
 }
 
 export async function startTui(agent: Agent, config: { project: string; provider: ProviderName; model: string; repositoryIndexStatus?: RepositoryIndexStatus }, actions?: TuiActions, runtime: TuiRuntime = {}, view = new TuiView({ write: runtime.write ?? ((text) => { stdout.write(text); }), provider: config.provider, model: config.model, renderMarkdown: runtime.renderMarkdown })): Promise<number> {
@@ -334,6 +342,25 @@ export async function startTui(agent: Agent, config: { project: string; provider
           view.updateSession(session.provider, session.model);
           write(`Switched to project: ${session.project}\n`);
         } catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
+        continue;
+      }
+      if (command.type === "provider") {
+        const current = session.provider;
+        if (!command.id) {
+          const lines = ["Providers:"];
+          for (const spec of listProviders()) {
+            const marker = spec.id === current ? "*" : " ";
+            lines.push(`  ${marker} ${spec.id} (${spec.name})`);
+          }
+          write(`${lines.join("\n")}\n`);
+        } else if (!actions?.provider) { write("Provider switching is unavailable in this mode.\n"); }
+        else {
+          try {
+            session = await actions.provider(session, command.id);
+            view.updateSession(session.provider, session.model);
+            write(`Switched to provider: ${providerDisplayName(session.provider)} (model: ${session.model})\n`);
+          } catch (error) { write(`Error: ${error instanceof Error ? error.message : "Command failed"}\n`); }
+        }
         continue;
       }
       if (command.type !== "prompt") continue;
