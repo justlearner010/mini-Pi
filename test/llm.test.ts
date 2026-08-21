@@ -68,7 +68,7 @@ test("captures reasoning_content from Provider response and passes it back on th
     { role: "user", content: "next" }
   ], []);
   const secondRequest = client.requests[1] as { messages: Array<Record<string, unknown>> };
-  assert.deepEqual(secondRequest.messages[2], { role: "assistant", content: "done", tool_calls: [], reasoning_content: "thought about it" });
+  assert.deepEqual(secondRequest.messages[2], { role: "assistant", content: "done", reasoning_content: "thought about it" });
 });
 
 test("drops empty or missing reasoning_content and omits the field from the next request", async () => {
@@ -81,6 +81,17 @@ test("drops empty or missing reasoning_content and omits the field from the next
   ], []);
   const secondRequest = client.requests[1] as { messages: Array<Record<string, unknown>> };
   assert.equal(secondRequest.messages[1].reasoning_content, undefined);
+});
+
+test("omits tool_calls from assistant messages that did not invoke any tool", async () => {
+  // DeepSeek rejects messages[].tool_calls as an empty array; only emit it when there are calls.
+  const client = fakeClient({ choices: [{ message: { content: "ok", tool_calls: [] } }] });
+  const llm = createLLM({ provider: "deepseek", model: "deepseek-v4-flash", apiKey: "secret" }, client);
+  await llm.generate([
+    { role: "user", content: "hi" }, { role: "assistant", content: "ok", toolCalls: [] }
+  ], []);
+  const request = client.requests[0] as { messages: Array<Record<string, unknown>> };
+  assert.equal(request.messages[1].tool_calls, undefined);
 });
 
 test("LLM telemetry reports allowlisted usage and cannot affect generation", async () => {

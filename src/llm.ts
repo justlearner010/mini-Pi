@@ -58,10 +58,12 @@ function clientFor(provider: ProviderName, apiKey: string): ProviderClient {
 function requestMessages(messages: Message[]): ProviderMessage[] {
   return messages.map((message) => {
     if (message.role === "assistant") {
-      const result: ProviderMessage = {
-        role: "assistant", content: message.content,
-        tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }))
-      };
+      const result: ProviderMessage = { role: "assistant", content: message.content };
+      // DeepSeek rejects an empty tool_calls array, so only include it when the assistant
+      // actually invoked tools in this turn.
+      if (message.toolCalls.length > 0) {
+        result.tool_calls = message.toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }));
+      }
       if (typeof message.reasoningContent === "string") result.reasoning_content = message.reasoningContent;
       return result;
     }
