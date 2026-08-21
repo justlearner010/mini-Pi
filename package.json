@@ -1,6 +1,6 @@
 {
   "name": "mini-pi",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -22,6 +22,7 @@
     "verify:repo-map": "npm run build && node scripts/verify-query-repo-map.mjs",
     "verify:deepseek-harness": "npm run build && node scripts/verify-deepseek-harness-repo-map.mjs",
     "verify:deepseek-harness:live": "npm run build && node scripts/verify-deepseek-harness-live.mjs",
+    "test:providers": "npm run build && node scripts/test-providers.mjs",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "tsx --test test/**/*.test.ts",
     "verify:bin": "node scripts/verify-bin.mjs",

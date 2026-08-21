@@ -59,6 +59,20 @@
 - `--provider`、`--model` 等参数的短名称。
 - 文件日志、可切换日志级别和 `/debug` 命令；当前只支持 `MINI_PI_DEBUG=1` 的安全 Provider 诊断。
 
+## B 档 — 下一轮在 A 档（多 Provider 注册表）稳定后推进
+
+- 流式输出（async stream of model tokens）。当前回答在 Agent.run 完成后一次性返回。
+- OAuth / 订阅 Provider 登录（Anthropic Claude Pro/Max、Google AI Studio 等）。
+- 模型注册表 + 能力探测（context window、supports tools、supports vision、supports thinking）。
+- 多 Provider 路由与自动 failover。
+- 单独的 Provider-specific reasoning_content / thinking 模式控制（DeepSeek / OpenAI / Anthropic 各家语义不同，目前只有 DeepSeek 走了 `extra_body` 显式 disable）。
+
+## C 档 — 多 protocol 支持（在 B 档之后）
+
+- Anthropic Messages API（与 OpenAI Chat Completions 不同的 tool_use blocks / 流式事件 / 错误结构）。
+- Google Generative AI（gemini-1.5 / 2.x 的 generateContent）。
+- AWS Bedrock Converse。
+
 ## 维护规则
 
 - 只有讨论中明确决定延期的功能才加入本文档。

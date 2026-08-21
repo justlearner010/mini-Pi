@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { Agent, type AgentEvent, type RequestApproval, type SwitchProjectResult } from "./agent.js";
-import { createLLM, listModels, type ProviderName } from "./llm.js";
+import { createLLM, listModels, listProviders, listProviderIds, lookupProvider, providerDisplayName, type ProviderName } from "./llm.js";
 import { buildRepositoryIndex, createQueryRepoMapTool, queryRepositoryIndex, switchProjectTool, tools, type RepoMapResult, type RepositoryIndex, type Tool } from "./tool.js";
 import { askApiKey, chooseModel, chooseProvider, chooseStoredProvider, formatEvent, requestTerminalApproval, startTui, TuiView, type TuiSession } from "./tui.js";
 
@@ -65,8 +65,12 @@ export function createSystemCredentialStore(load: () => CredentialStore = () => 
 }
 export const systemCredentials = createSystemCredentialStore();
 
-function environmentName(provider: ProviderName): "OPENAI_API_KEY" | "DEEPSEEK_API_KEY" {
-  return provider === "openai" ? "OPENAI_API_KEY" : "DEEPSEEK_API_KEY";
+function environmentName(provider: ProviderName): string {
+  try {
+    const envs = lookupProvider(provider).apiKeyEnv;
+    if (!envs.length) throw new Error(`Provider ${provider} does not use an environment API key`);
+    return envs[0]!;
+  } catch { return ""; }
 }
 
 export function defaultConfigPath(home = homedir()): string {
@@ -76,12 +80,12 @@ export function defaultConfigPath(home = homedir()): string {
 function isPreference(value: unknown): value is GlobalPreference {
   const item = value as { provider?: unknown; model?: unknown };
   return typeof value === "object" && value !== null && Object.keys(value).length === 2 && Object.keys(value).every((key) => key === "provider" || key === "model")
-    && (item.provider === "openai" || item.provider === "deepseek") && typeof item.model === "string" && item.model.length > 0;
+    && typeof item.provider === "string" && listProviderIds().includes(item.provider) && typeof item.model === "string" && item.model.length > 0;
 }
 
 function hasPreferenceFields(value: unknown): value is GlobalPreference {
   const item = value as { provider?: unknown; model?: unknown };
-  return typeof value === "object" && value !== null && (item.provider === "openai" || item.provider === "deepseek")
+  return typeof value === "object" && value !== null && typeof item.provider === "string" && listProviderIds().includes(item.provider)
     && typeof item.model === "string" && item.model.length > 0;
 }
 
@@ -147,7 +151,7 @@ export async function selectAndSaveModel(preference: GlobalPreference, apiKey: s
 }
 
 export async function logoutFromCredentialStore(credentials: CredentialStore, preference: GlobalPreference | undefined, choose: (providers: ProviderName[]) => Promise<ProviderName>, clearPreference: () => Promise<void>): Promise<ProviderName | undefined> {
-  const providers = (await Promise.all((['openai', 'deepseek'] as ProviderName[]).map(async (provider) => (await credentials.getPassword(CREDENTIAL_SERVICE, provider)) ? provider : undefined))).filter((value): value is ProviderName => Boolean(value));
+  const providers = (await Promise.all(listProviderIds().map(async (provider) => (await credentials.getPassword(CREDENTIAL_SERVICE, provider)) ? provider : undefined))).filter((value): value is ProviderName => Boolean(value));
   if (!providers.length) return undefined;
   const provider = await choose(providers);
   await credentials.deletePassword(CREDENTIAL_SERVICE, provider);
@@ -165,7 +169,7 @@ export function parseArgs(args: string[]): CliOptions {
   try { ({ values, positionals } = nodeParseArgs({ args, options: { provider: { type: "string" }, model: { type: "string" }, prompt: { type: "string" }, help: { type: "boolean", short: "h" }, version: { type: "boolean", short: "v" } }, allowPositionals: true, strict: true })); }
   catch (error) { throw new Error(error instanceof Error ? error.message : "Invalid arguments"); }
   if (positionals.length > 1) throw new Error("Specify at most one project directory");
-  if (values.provider && values.provider !== "openai" && values.provider !== "deepseek") throw new Error("Provider must be openai or deepseek");
+  if (values.provider && !listProviderIds().includes(values.provider)) throw new Error(`Unknown provider: ${values.provider} (available: ${listProviderIds().join(", ")})`);
   return { project: positionals[0] ?? ".", provider: values.provider as ProviderName | undefined, model: values.model, prompt: values.prompt, help: values.help ?? false, version: values.version ?? false };
 }
 
@@ -229,7 +233,7 @@ For full-project analysis, include:
 - important entry points;
 - the dependency structure;
 - cycles, unresolved imports, unsupported files, and limitations.`;
-function usage(): string { return "Usage: mini-pi [project] [--provider openai|deepseek --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage."; }
+function usage(): string { return `Usage: mini-pi [project] [--provider ${listProviderIds().join("|")} --model MODEL] [--prompt TEXT]\n\nKeys: environment variables or secure system credential storage.`; }
 function makeAgent(options: Required<Pick<ValidatedOptions, "provider" | "model" | "apiKey" | "rootDir">>, agentTools: Tool[], onEvent: (event: AgentEvent) => void, requestApproval?: RequestApproval, messages?: ReturnType<Agent["history"]>, switchProject?: (path: string) => Promise<SwitchProjectResult>): Agent {
   return new Agent({ llm: createLLM({ provider: options.provider, model: options.model, apiKey: options.apiKey }), tools: agentTools, rootDir: options.rootDir, systemPrompt: SYSTEM_PROMPT, onEvent, requestApproval, switchProject, messages });
 }
@@ -307,11 +311,21 @@ export async function run(args = process.argv.slice(2), env = process.env, cwd =
     view.repositoryIndexStatus(indexStatus());
     return buildSession({ provider: current.provider, model: current.model }, key.apiKey, rootDir);
   };
+  const providerSwitch = async (current: TuiSession, id: string): Promise<TuiSession> => {
+    const key = await resolveApiKey(id, systemCredentials, env);
+    if (!key) throw new Error(`No API key for ${providerDisplayName(id)}; set ${environmentName(id) || "the appropriate env var"} or run /login`);
+    const models = await listModels(id, key.apiKey);
+    if (!models.length) throw new Error(`No models available for ${providerDisplayName(id)}`);
+    const model = await chooseModel(models);
+    await saveGlobalPreference({ provider: id, model });
+    return buildSession({ provider: id, model }, key.apiKey, current.project, current.agent.history());
+  };
   return startTui(session.agent, { project: valid.rootDir!, provider: session.provider, model: session.model, repositoryIndexStatus: indexStatus() }, {
     login: async (current) => { const next = await loginWithCredentialStore({ credentials: systemCredentials, chooseProvider, chooseModel, askApiKey, listModels, savePreference: saveGlobalPreference }); return buildSession(next, next.apiKey, current.project, current.agent.history()); },
     model: async (current) => { const key = await resolveApiKey(current.provider, systemCredentials, env); if (!key) throw new Error(`No saved API key for ${current.provider}; use /login`); const next = await selectAndSaveModel({ provider: current.provider, model: current.model }, key.apiKey, { listModels, chooseModel, savePreference: saveGlobalPreference }); return buildSession(next, key.apiKey, current.project, current.agent.history()); },
     logout: async () => logoutFromCredentialStore(systemCredentials, await readGlobalPreference(), chooseStoredProvider, clearGlobalPreference),
-    project: projectSwitch
+    project: projectSwitch,
+    provider: providerSwitch
   }, { runAgent: async (agent, prompt) => ({ result: await runWithNavigation(agent, prompt, navigation), project: lastProject }) }, view);
 }
 

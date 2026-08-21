@@ -411,7 +411,7 @@ test("parseArgs recognizes help, version, provider, model, prompt, and project",
 });
 
 test("parseArgs rejects unsupported providers and extra projects", () => {
-  assert.throws(() => parseArgs(["--provider", "other"]), /Provider/);
+  assert.throws(() => parseArgs(["--provider", "other"]), /provider/);
   assert.throws(() => parseArgs(["one", "two"]), /one project/);
 });
 
@@ -532,6 +532,47 @@ test("/project parses a path while preserving spaces and optional surrounding qu
 test("help text advertises the project switch command", () => {
   assert.match(helpText("/tmp/demo", "openai", "gpt"), /\/project <directory>/);
   assert.match(helpText("/tmp/demo", "openai", "gpt"), /Project: \/tmp\/demo/);
+});
+
+test("parseCommand recognises the /provider command", () => {
+  assert.deepEqual(parseCommand("/provider"), { type: "provider" });
+  assert.deepEqual(parseCommand("/provider openrouter"), { type: "provider", id: "openrouter" });
+  assert.deepEqual(parseCommand("/provider nope"), { type: "unknown", command: "/provider nope" });
+});
+
+test("TUI lists providers with the current one marked", async () => {
+  const output: string[] = [];
+  const inputs = ["/provider", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  await startTui({ reset() {} } as never, { project: "/project", provider: "deepseek", model: "chat" }, undefined, runtime);
+  const text = output.join("");
+  assert.match(text, /DeepSeek/);
+  assert.match(text, /OpenAI/);
+  assert.match(text, /OpenRouter/);
+  assert.match(text, /\* deepseek/);
+  assert.match(text, /Ollama/);
+});
+
+test("TUI switches provider through the /provider action", async () => {
+  const output: string[] = [];
+  const inputs = ["/provider openrouter", "after", "/exit"];
+  const runtime: TuiRuntime = {
+    createLine: () => ({ question: async () => inputs.shift() ?? Promise.reject({ code: "EOF" }), close: () => undefined }),
+    write: (text) => { output.push(text); }
+  };
+  let switched = false;
+  await startTui({ reset() {} } as never, { project: "/project", provider: "openai", model: "gpt" }, {
+    login: async (s) => s,
+    model: async (s) => s,
+    logout: async () => undefined,
+    provider: async (s, id) => { switched = id === "openrouter"; return { ...s, provider: id, model: "x" }; }
+  }, runtime);
+  assert.equal(switched, true);
+  const text = output.join("");
+  assert.match(text, /Switched to provider: OpenRouter/);
 });
 
 test("agent events format without leaking full tool content", () => {
@@ -757,11 +798,19 @@ test("model-only CLI resolves the selected provider's saved credential", async (
   assert.equal(complete.apiKey, "stored-key");
 });
 
-test("help identifies the active project provider and model, and system prompt is exact", () => {
-  assert.match(helpText("/project", "openai", "gpt"), /Project: \/project/);
-  assert.match(helpText("/project", "openai", "gpt"), /Provider: openai/);
-  assert.match(helpText("/project", "openai", "gpt"), /Model: gpt/);
-  assert.match(helpText("/project", "openai", "gpt"), /\/login, \/model, \/logout/);
+test("help identifies the active project provider and model, and lists every command", () => {
+  const help = helpText("/project", "openai", "gpt");
+  assert.match(help, /Project: \/project/);
+  assert.match(help, /Provider: openai/);
+  assert.match(help, /Model: gpt/);
+  assert.match(help, /\/login/);
+  assert.match(help, /\/model/);
+  assert.match(help, /\/provider/);
+  assert.match(help, /\/logout/);
+  assert.match(help, /\/project <directory>/);
+  assert.match(help, /\/help/);
+  assert.match(help, /\/reset/);
+  assert.match(help, /\/exit/);
   assert.match(SYSTEM_PROMPT, /Use tools to gather evidence before making claims/);
   assert.match(SYSTEM_PROMPT, /Answer in the user's language/);
 });

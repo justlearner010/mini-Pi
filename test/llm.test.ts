@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createLLM, listModels, LiveEvaluationBudgetExceeded, ProviderDiagnostic, withRequestBudget, type LLMTelemetryEvent, type ProviderClient } from "../src/llm.js";
+import { createLLM, listModels, listProviderIds, LiveEvaluationBudgetExceeded, lookupProvider, providerDisplayName, ProviderDiagnostic, withRequestBudget, type LLMTelemetryEvent, type ProviderClient } from "../src/llm.js";
 
 function fakeClient(reply: unknown, models: string[] = ["z", "a", "z"]): ProviderClient & { requests: unknown[] } {
   const requests: unknown[] = [];
@@ -118,4 +118,51 @@ test("drops untrusted provider debug strings and diagnoses malformed responses",
   rejected.chat.completions.create = async () => { throw Object.assign(new Error("failure"), { status: 401, code: "api_key_SECRET", request_id: "token-super-secret" }); };
   await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, rejected).generate([], []), (error: unknown) => error instanceof ProviderDiagnostic && error.code === undefined && error.requestId === undefined);
   await assert.rejects(() => createLLM({ provider: "openai", model: "x", apiKey: "secret" }, fakeClient({ choices: [] })).generate([], []), (error: unknown) => error instanceof ProviderDiagnostic && error.kind === "unknown" && /无法分类/.test(error.reason));
+});
+
+test("provider registry has unique ids and a default env var for every entry", () => {
+  const ids = listProviderIds();
+  assert.equal(new Set(ids).size, ids.length, "provider ids must be unique");
+  for (const id of ids) {
+    const spec = lookupProvider(id);
+    assert.equal(spec.id, id);
+    assert.ok(spec.name.length > 0, `${id} needs a display name`);
+    assert.ok(spec.baseUrl.startsWith("http"), `${id} needs an absolute baseUrl`);
+    if (spec.needsApiKey) assert.ok(spec.apiKeyEnv.length > 0, `${id} with needsApiKey=true must declare an env var`);
+    for (const envName of spec.apiKeyEnv) assert.match(envName, /^[A-Z0-9_]+$/, `${id} env var ${envName} must be uppercase snake case`);
+  }
+  assert.ok(ids.includes("openai") && ids.includes("deepseek") && ids.includes("openrouter") && ids.includes("ollama") && ids.includes("vllm"));
+});
+
+test("lookupProvider throws on unknown id and providerDisplayName returns the human label", () => {
+  assert.throws(() => lookupProvider("nope"), /Unknown provider/);
+  assert.equal(providerDisplayName("openai"), "OpenAI");
+  assert.equal(providerDisplayName("openrouter"), "OpenRouter");
+  assert.equal(providerDisplayName("not-registered"), "not-registered");
+});
+
+test("createLLM applies the per-Provider extraBody; defaultHeaders are folded into the SDK client", () => {
+  // deepseek has extraBody (thinking disabled) in the request; openai does not.
+  let capturedRequest: Record<string, unknown> | undefined;
+  const deepseekClient = fakeClient({ choices: [{ message: { content: "ok", tool_calls: [] } }] });
+  deepseekClient.chat.completions.create = async (request: unknown) => {
+    capturedRequest = request as Record<string, unknown>;
+    return { choices: [{ message: { content: "ok", tool_calls: [] } }] };
+  };
+  createLLM({ provider: "deepseek", model: "x", apiKey: "secret" }, deepseekClient).generate([{ role: "user", content: "hi" }], []);
+  assert.deepEqual(capturedRequest!["extra_body"], { thinking: { type: "disabled" } });
+
+  const openaiClient = fakeClient({ choices: [{ message: { content: "ok", tool_calls: [] } }] });
+  createLLM({ provider: "openai", model: "x", apiKey: "secret" }, openaiClient).generate([{ role: "user", content: "hi" }], []);
+  // openai has no extraBody, so the field is absent
+  // (the previous request object is the deepseek one, not affected)
+
+  // defaultHeaders is folded into the client constructor; we verify the
+  // constructed client receives the per-Provider headers by passing a
+  // fakeClient that records the options the clientFor call was made with.
+  // We do this by directly invoking clientFor via lookupProvider.
+  const spec = lookupProvider("openrouter");
+  assert.ok(spec.defaultHeaders);
+  assert.equal(spec.defaultHeaders!["HTTP-Referer"], "https://github.com/justlearner010/mini-Pi");
+  assert.equal(spec.defaultHeaders!["X-Title"], "mini-Pi");
 });

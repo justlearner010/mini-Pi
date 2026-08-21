@@ -4,14 +4,14 @@
 
 ## 架构
 
-核心始终只有五个源文件：
+核心按职责切分五个源文件，保持精简（按需增长，避免无意义拆分，也避免堆成大块）：
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/llm.ts` | 统一 OpenAI 与 DeepSeek 的模型调用和消息转换。 |
+| `src/llm.ts` | Provider 注册表（OpenAI Chat Completions 兼容的多 provider）、消息转换、错误诊断归一。 |
 | `src/agent.ts` | 保存消息历史，运行“模型 → 工具 → 模型”的 Agent loop。 |
 | `src/tool.ts` | 提供只读项目工具，并限制路径、大小与依赖分析范围。 |
-| `src/cli.ts` | 处理启动参数、全局偏好、系统凭据与各层装配。 |
+| `src/cli.ts` | 处理启动参数、全局偏好、Provider / Model / Key 凭据与各层装配。 |
 | `src/tui.ts` | 提供终端输入、命令和上下键选择；移除它不影响 Agent 核心。 |
 
 ## 功能阶段
@@ -91,11 +91,29 @@ mini-pi ../my-project
 
 TUI 内可输入问题，或使用以下命令：
 
-- `/login`：新增或替换某个 Provider 的 Key，并选择新的默认模型。
+- `/login`：新增或替换当前 Provider 的 Key，并选择新的默认模型。
 - `/model`：为当前 Provider 拉取模型列表并切换默认模型。
+- `/provider [id]`：不带参数时列出已注册的 Provider 并标记当前使用的；带参数时切换到该 Provider（需要该 Provider 的 Key 已配置）。
 - `/logout`：上下键选择一个已登录 Provider，删除它的系统凭据。
 - `/project <目录>`：切换到另一个项目目录（绝对或相对路径均可，含空格或引号的目录名按 Shell 习惯处理），重新构建 Repository Index 并清空当前对话，之后即可分析新项目；默认 Provider 与模型保持不变。Agent 也可以自行发起切换：当问题涉及当前根目录之外的项目时，它会调用 `switch_project` 工具并在终端展示目标路径，你输入 `y` 确认后即完成切换并继续分析。
 - `/help`、`/reset`、`/exit`：查看信息、清空当前对话（也会清除本次会话的活动记录）、退出。
+
+### Providers
+
+mini-Pi 通过 OpenAI Chat Completions 协议连接多 Provider，配置通过 `src/llm.ts` 的 `providerRegistry` 维护（加一个 Provider 只改配置、不改协议代码）：
+
+| ID | 显示名 | 备注 |
+| --- | --- | --- |
+| `openai` | OpenAI | `OPENAI_API_KEY` |
+| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY`，自动加 `extra_body.thinking.disabled` |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY`，自动加 `HTTP-Referer` / `X-Title` header |
+| `together` | Together AI | `TOGETHER_API_KEY` |
+| `groq` | Groq | `GROQ_API_KEY` |
+| `mistral` | Mistral | `MISTRAL_API_KEY` |
+| `ollama` | Ollama (local) | `http://localhost:11434/v1`，无需 Key |
+| `vllm` | vLLM (local) | `http://localhost:8000/v1`，无需 Key |
+
+OAuth / Anthropic / Google 等需要新协议的 Provider 是 B 档、C 档延后项，见 [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)。
 
 模型的最终回答支持常见 Markdown：标题、列表、粗体/斜体、行内代码、代码块和引用会以适合终端阅读的形式显示。回答仍是非流式的：一次 Agent 运行结束后才展示最终答案。工具活动默认收起为 `▸ activity · N tools · duration`；在空输入处直接按 Enter 可展开或再次收起最近一次活动。没有可展开活动时，空 Enter 不做任何事。活动只保留安全的工具名称和简短失败摘要，不会显示完整工具输出或推理内容。
 
@@ -144,6 +162,16 @@ npm run verify:package
 ```
 
 自动化测试使用假的凭据库和 Provider 客户端；仓库不会用真实 API Key 或真实系统凭据做测试。真实 OpenAI / DeepSeek 请求也没有在自动化测试中验证，因为它们需要你的凭据且可能产生费用。
+
+多 Provider 真实端到端测试（opt-in，消耗 token / 钱）：
+
+```sh
+MINI_PI_TEST_PROVIDERS=deepseek,openrouter \
+  DEEPSEEK_API_KEY=sk-... OPENROUTER_API_KEY=sk-... \
+  npm run test:providers
+```
+
+脚本对每个 Provider 并行跑 12 轮 Agent + 一次会话内项目切换，打印对比表（哪些 Provider 通过、第一条失败在第几轮、用了多少时间）。未指定 `MINI_PI_TEST_PROVIDERS` 时自动选取所有有可用 Key 的 Provider。
 
 Repo Map 的本地确定性实验可运行：
 
